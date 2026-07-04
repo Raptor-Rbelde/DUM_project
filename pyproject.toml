@@ -1,0 +1,21 @@
+[project]
+name = "sentinel-local-first"
+version = "0.1.0"
+description = "Local-first privacy gateway MVP for meeting intelligence on Jetson-class devices."
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115",
+  "pydantic>=2.0",
+  "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

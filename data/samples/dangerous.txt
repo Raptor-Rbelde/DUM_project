@@ -1,0 +1,3 @@
+Incident review.
+
+Sofia Martinez pasted OPENAI_API_KEY=sk-example-not-real-123456789 while discussing cliente Acme Corp. Password: not-real-demo-only. Decision: rotate demo credentials today. Action item: confirm no real secrets were shared outside Sentinel.
