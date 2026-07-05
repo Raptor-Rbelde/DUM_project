@@ -180,7 +180,7 @@ declare global {
   }
 }
 
-const API_BASE = import.meta.env.VITE_SENTINEL_API_BASE ?? "http://127.0.0.1:8000";
+const API_BASE = import.meta.env.VITE_SENTINEL_API_BASE ?? (window.location.port === "5173" ? "http://127.0.0.1:8000" : "");
 const SYSTEM_MODE: Mode = "INTELLIGENCE";
 const WAKE_CHUNK_MS = 3200;
 const BROWSER_WAKE_SILENCE_MS = 6500;

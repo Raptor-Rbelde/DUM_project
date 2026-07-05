@@ -73,6 +73,12 @@ For a buildathon demo, start API and web together:
 make demo
 ```
 
+## Deployment
+
+The recommended buildathon deploy is one Docker web service with a persistent `/var/data` volume for local SQLite memory. The included `render.yaml` is ready for Render Blueprint deployment.
+
+See [docs/deployment.md](docs/deployment.md).
+
 ## API Highlights
 
 - `GET /health`

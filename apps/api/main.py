@@ -4,6 +4,8 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from sentinel.audit.store import AuditStore
@@ -90,6 +92,30 @@ SECURITY_CHECK_CASES = [
         "expected_blocked": False,
     },
 ]
+
+
+def mount_web_app(app: FastAPI, dist_dir: Path) -> None:
+    if not dist_dir.exists():
+        return
+
+    resolved_dist = dist_dir.resolve()
+    assets_dir = resolved_dist / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="web-assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def serve_web_app(full_path: str):
+        if full_path == "health" or full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not found")
+
+        requested_path = (resolved_dist / full_path).resolve()
+        if requested_path.is_file() and requested_path.is_relative_to(resolved_dist):
+            return FileResponse(requested_path)
+
+        index_path = resolved_dist / "index.html"
+        if index_path.exists():
+            return FileResponse(index_path)
+        raise HTTPException(status_code=404, detail="Web app build not found")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -398,6 +424,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         reconstructed = privacy_engine.reconstruct(result.response, session_id=request.session_id) if result.sent else result.response
         return {"external_ai": result, "safe_purpose": safe_purpose, "reconstructed_response": reconstructed}
+
+    mount_web_app(app, app_settings.web_dist_dir)
 
     return app
 

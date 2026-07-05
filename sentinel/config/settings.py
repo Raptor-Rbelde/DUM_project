@@ -57,6 +57,7 @@ class Settings:
     elevenlabs_tts_output_format: str = field(default_factory=lambda: os.getenv("ELEVENLABS_TTS_OUTPUT_FORMAT", "mp3_44100_128"))
     elevenlabs_enable_logging: bool = field(default_factory=lambda: _env_bool("ELEVENLABS_ENABLE_LOGGING", True))
     elevenlabs_timeout_seconds: int = field(default_factory=lambda: int(os.getenv("ELEVENLABS_TIMEOUT_SECONDS", "90")))
+    web_dist_dir: Path = field(default_factory=lambda: Path(os.getenv("SENTINEL_WEB_DIST", str(PROJECT_ROOT / "apps" / "web" / "dist"))))
     cors_origins: list[str] = field(
         default_factory=lambda: _env_list(
             "SENTINEL_CORS_ORIGINS",

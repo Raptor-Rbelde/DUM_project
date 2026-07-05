@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: teo-sentinel
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    disk:
+      name: sentinel-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: EXTERNAL_AI_ENABLED
+        value: "true"
+      - key: SENTINEL_DATA_DIR
+        value: /var/data
+      - key: SENTINEL_DB_PATH
+        value: /var/data/sentinel.sqlite
+      - key: SENTINEL_WEB_DIST
+        value: /app/apps/web/dist
+      - key: SENTINEL_LOCAL_ML_ENABLED
+        value: "true"
+      - key: SENTINEL_LOCAL_ML_MODEL_PATH
+        value: /app/data/models/sensitive_sequence_tagger.json
+      - key: OPENAI_MODEL
+        value: "gpt-4o-mini"
+      - key: ELEVENLABS_STT_MODEL
+        value: "scribe_v2"
+      - key: ELEVENLABS_TTS_MODEL
+        value: "eleven_multilingual_v2"
+      - key: ELEVENLABS_ENABLE_LOGGING
+        value: "true"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
