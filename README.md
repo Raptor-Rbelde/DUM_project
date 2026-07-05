@@ -3,11 +3,12 @@
 Sentinel is a local-first privacy gateway MVP for meeting intelligence on Jetson-class hardware. This bootstrap implements a runnable vertical slice:
 
 1. Paste or load a meeting transcript.
-2. Analyze it locally with the Sentinel Privacy Engine.
-3. Detect sensitive entities, secrets, dates, money, clients, and identities.
-4. Block restricted data, pseudonymize confidential data, and minimize internal data.
-5. Send the safe payload to the configured external AI API for intelligence.
-6. Keep vault mappings and audit events local in SQLite.
+2. Record or upload meeting audio and transcribe it through ElevenLabs Speech to Text.
+3. Analyze the resulting transcript locally with the Sentinel Privacy Engine.
+4. Detect sensitive entities, secrets, dates, money, clients, and identities.
+5. Block restricted data, pseudonymize confidential data, and minimize internal data.
+6. Send the safe payload to the configured external AI API for intelligence.
+7. Keep vault mappings, vector memory, and audit events local in SQLite.
 
 ## Repository Layout
 
@@ -26,6 +27,26 @@ docs            Architecture, threat model, demo flow
 The web app runs in API-backed intelligence mode. Sentinel still performs privacy detection, redaction, pseudonymization, validation, vault mapping, and audit logging locally before any provider call.
 
 External AI calls are sent only when `EXTERNAL_AI_ENABLED=true`, a provider key is configured, the safe payload passes local validation, and the request has an explicit purpose.
+
+## Audio Transcription
+
+Sentinel can receive browser microphone recordings or uploaded audio/video files and transcribe them server-side with ElevenLabs. The browser never receives the ElevenLabs key; it sends raw audio to Sentinel, and the API calls `POST https://api.elevenlabs.io/v1/speech-to-text` with `model_id=scribe_v2`.
+
+Configure:
+
+```bash
+ELEVENLABS_API_KEY=your_key_here
+ELEVENLABS_STT_MODEL=scribe_v2
+ELEVENLABS_ENABLE_LOGGING=true
+```
+
+For enterprise ElevenLabs accounts, `ELEVENLABS_ENABLE_LOGGING=false` requests zero retention mode for transcription requests. Keep it `true` if your account does not support zero retention.
+
+API endpoint:
+
+- `POST /api/audio/transcribe`
+
+After transcription, the text is placed into the same local privacy, memory, ticket routing, and safe external AI pipeline.
 
 ## Local Setup
 
@@ -50,6 +71,7 @@ Open `http://127.0.0.1:5173`.
 
 - `GET /health`
 - `GET /api/system/status`
+- `POST /api/audio/transcribe`
 - `POST /api/privacy/analyze`
 - `POST /api/privacy/sanitize`
 - `POST /api/meetings`

@@ -30,6 +30,10 @@ class Settings:
     local_ml_model_path: Path = field(default_factory=lambda: Path(os.getenv("SENTINEL_LOCAL_ML_MODEL_PATH", str(DEFAULT_SEQUENCE_MODEL_PATH))))
     openai_api_key: str | None = field(default_factory=lambda: os.getenv("OPENAI_API_KEY") or None)
     openai_model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    elevenlabs_api_key: str | None = field(default_factory=lambda: os.getenv("ELEVENLABS_API_KEY") or None)
+    elevenlabs_stt_model: str = field(default_factory=lambda: os.getenv("ELEVENLABS_STT_MODEL", "scribe_v2"))
+    elevenlabs_enable_logging: bool = field(default_factory=lambda: _env_bool("ELEVENLABS_ENABLE_LOGGING", True))
+    elevenlabs_timeout_seconds: int = field(default_factory=lambda: int(os.getenv("ELEVENLABS_TIMEOUT_SECONDS", "90")))
     cors_origins: list[str] = field(
         default_factory=lambda: _env_list(
             "SENTINEL_CORS_ORIGINS",

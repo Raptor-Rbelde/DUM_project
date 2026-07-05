@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -18,6 +18,7 @@ from sentinel.privacy.engine import PrivacyEngine
 from sentinel.privacy.hybrid_detector import build_privacy_detector
 from sentinel.privacy.vault import EntityVault
 from sentinel.providers.cloud_gateway import CloudGateway, SafePayloadValidator
+from sentinel.providers.elevenlabs_provider import ElevenLabsSpeechToTextProvider
 from sentinel.providers.openai_provider import OpenAIProvider
 
 
@@ -69,6 +70,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     memory_store = PersistentMemoryStore(app_settings.db_path)
     memory_service = MemoryService(memory_store, privacy_engine, audit_store)
     provider = OpenAIProvider(api_key=app_settings.openai_api_key, model=app_settings.openai_model)
+    speech_provider = ElevenLabsSpeechToTextProvider(
+        api_key=app_settings.elevenlabs_api_key,
+        model_id=app_settings.elevenlabs_stt_model,
+        enable_logging=app_settings.elevenlabs_enable_logging,
+        timeout_seconds=app_settings.elevenlabs_timeout_seconds,
+    )
     cloud_gateway = CloudGateway(app_settings, audit_store, provider, validator=SafePayloadValidator(detector=privacy_detector))
 
     app = FastAPI(
@@ -100,6 +107,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 getattr(getattr(privacy_detector, "ml_detector", None), "available", False)
             ),
             "openai_key_configured": bool(app_settings.openai_api_key),
+            "elevenlabs_key_configured": bool(app_settings.elevenlabs_api_key),
+            "elevenlabs_stt_model": app_settings.elevenlabs_stt_model,
             "db_path": str(Path(app_settings.db_path)),
             "memory": memory_service.counts(),
         }
@@ -119,6 +128,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "session_id": analysis.session_id,
             "safe_content": analysis.safe_content,
             "report": analysis.report(),
+        }
+
+    @app.post("/api/audio/transcribe")
+    async def transcribe_audio(
+        request: Request,
+        language_code: str | None = Query(default="es", min_length=2, max_length=8),
+        diarize: bool = Query(default=True),
+        num_speakers: int | None = Query(default=None, ge=1, le=32),
+        x_sentinel_filename: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        audio = await request.body()
+        if not audio:
+            raise HTTPException(status_code=400, detail="Audio payload is empty")
+        filename = x_sentinel_filename or "sentinel-recording.webm"
+        try:
+            result = speech_provider.transcribe_bytes(
+                audio,
+                filename=filename,
+                content_type=request.headers.get("content-type"),
+                language_code=language_code,
+                diarize=diarize,
+                num_speakers=num_speakers,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        audit_store.record(
+            "audio_transcribed",
+            metadata={
+                "provider": result.provider,
+                "model_id": result.model_id,
+                "bytes": len(audio),
+                "language_code": result.language_code,
+                "diarize": diarize,
+            },
+        )
+        return {
+            "provider": result.provider,
+            "model_id": result.model_id,
+            "text": result.text,
+            "language_code": result.language_code,
+            "language_probability": result.language_probability,
+            "words": result.words,
         }
 
     @app.post("/api/meetings")
