@@ -114,6 +114,21 @@ type AskMemoryOptions = {
   excludeCurrent?: boolean;
 };
 
+type SecurityCheck = {
+  id: string;
+  name: string;
+  blocked: boolean;
+  expected_blocked: boolean;
+  passed: boolean;
+  reason: string;
+};
+
+type SecurityCheckResponse = {
+  passed: number;
+  total: number;
+  checks: SecurityCheck[];
+};
+
 type TranscriptionResponse = {
   provider: string;
   model_id: string;
@@ -199,6 +214,8 @@ function App() {
   const [selectedMemory, setSelectedMemory] = useState<MemoryDetail | null>(null);
   const [lastRemembered, setLastRemembered] = useState<RememberedTranscript | null>(null);
   const [memoryListStatus, setMemoryListStatus] = useState<"idle" | "running" | "done" | "error">("idle");
+  const [securityChecks, setSecurityChecks] = useState<SecurityCheckResponse | null>(null);
+  const [securityCheckStatus, setSecurityCheckStatus] = useState<"idle" | "running" | "done" | "error">("idle");
   const [memorySearch, setMemorySearch] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
@@ -252,6 +269,7 @@ function App() {
 
   useEffect(() => {
     void loadMemoryItems();
+    void runSecurityChecks();
   }, []);
 
   useEffect(() => {
@@ -449,6 +467,21 @@ function App() {
     } catch (err) {
       setMemoryListStatus("error");
       setError(err instanceof Error ? err.message : "Memory list failed");
+    }
+  }
+
+  async function runSecurityChecks() {
+    setSecurityCheckStatus("running");
+    try {
+      const response = await fetch(`${API_BASE}/api/security/checks`);
+      if (!response.ok) {
+        throw new Error(`Security checks failed: ${response.status}`);
+      }
+      setSecurityChecks((await response.json()) as SecurityCheckResponse);
+      setSecurityCheckStatus("done");
+    } catch (err) {
+      setSecurityCheckStatus("error");
+      setError(err instanceof Error ? err.message : "Security checks failed");
     }
   }
 
@@ -1780,9 +1813,38 @@ function App() {
           <div className="lcd-answer-meta">
             <span>{analysis ? `${analysis.counts.total_entities} protegidos` : "Privacidad lista"}</span>
             <span>{memoryItems.length} memorias</span>
+            <span>
+              {securityChecks
+                ? `Security ${securityChecks.passed}/${securityChecks.total}`
+                : securityCheckStatus === "running"
+                  ? "Security..."
+                  : "Security listo"}
+            </span>
             <span>{wakeEnabled ? "Hola TEO activo" : "Wake apagado"}</span>
           </div>
         </section>
+
+        <details className="security-check-panel">
+          <summary>
+            <span>Security Check</span>
+            <strong>
+              {securityChecks ? `${securityChecks.passed}/${securityChecks.total} OK` : securityCheckStatus}
+            </strong>
+          </summary>
+          <div className="security-check-grid">
+            {(securityChecks?.checks ?? []).map((check) => (
+              <div className={`security-check-card ${check.passed ? "passed" : "failed"}`} key={check.id}>
+                <strong>{check.name}</strong>
+                <span>{check.blocked ? "Bloqueado" : "Permitido"} · {check.passed ? "OK" : "Revisar"}</span>
+                <p>{check.reason}</p>
+              </div>
+            ))}
+            {!securityChecks && <p className="empty-state">Ejecuta los checks para validar prompt injection.</p>}
+          </div>
+          <button className="lcd-secondary-action" onClick={() => void runSecurityChecks()} disabled={securityCheckStatus === "running"}>
+            {securityCheckStatus === "running" ? "Validando" : "Revalidar"}
+          </button>
+        </details>
 
         <section className="source-dock">
           <div className="dock-head">

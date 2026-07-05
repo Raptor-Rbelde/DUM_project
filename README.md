@@ -67,10 +67,17 @@ make web
 
 Open `http://127.0.0.1:5173`.
 
+For a buildathon demo, start API and web together:
+
+```bash
+make demo
+```
+
 ## API Highlights
 
 - `GET /health`
 - `GET /api/system/status`
+- `GET /api/security/checks`
 - `POST /api/audio/transcribe`
 - `POST /api/privacy/analyze`
 - `POST /api/privacy/sanitize`

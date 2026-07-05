@@ -2,7 +2,7 @@ PYTHON ?= python3
 API_HOST ?= 127.0.0.1
 API_PORT ?= 8000
 
-.PHONY: install install-dev test api web dev clean
+.PHONY: install install-dev test api web dev demo clean
 
 install:
 	$(PYTHON) -m pip install -r requirements.txt
@@ -22,6 +22,9 @@ web:
 
 dev:
 	@echo "Run 'make api' and 'make web' in separate terminals."
+
+demo:
+	bash scripts/start_teo_demo.sh
 
 clean:
 	find . -name '__pycache__' -type d -prune -exec rm -rf {} +
