@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-type Mode = "VAULT" | "INTELLIGENCE";
+type Mode = "INTELLIGENCE";
 
 type Entity = {
   type: string;
@@ -45,7 +45,22 @@ type RememberedTranscript = {
   tasks: string[];
   decisions: string[];
   risks: string[];
+  areas: EnterpriseArea[];
+  task_segments: TaskSegment[];
   analysis: PrivacyAnalysis;
+};
+
+type EnterpriseArea = {
+  area: string;
+  score: number;
+  evidence: string[];
+};
+
+type TaskSegment = {
+  description: string;
+  area: string;
+  role: string;
+  confidence: number;
 };
 
 type MemoryDashboardItem = {
@@ -58,6 +73,8 @@ type MemoryDashboardItem = {
   tasks: string[];
   decisions: string[];
   risks: string[];
+  areas: EnterpriseArea[];
+  task_segments: TaskSegment[];
   risk_level: string;
   entities: number;
   chunks?: number | null;
@@ -80,6 +97,8 @@ type MemorySource = {
   tasks: string[];
   decisions: string[];
   risks: string[];
+  areas: EnterpriseArea[];
+  task_segments: TaskSegment[];
   created_at: string;
 };
 
@@ -92,6 +111,7 @@ type MemoryAnswer = {
 };
 
 const API_BASE = import.meta.env.VITE_SENTINEL_API_BASE ?? "http://127.0.0.1:8000";
+const SYSTEM_MODE: Mode = "INTELLIGENCE";
 
 const samples = {
   normal:
@@ -106,7 +126,6 @@ const defaultRequest =
   "Extrae un resumen ejecutivo, decisiones, tareas accionables, riesgos y próximos pasos usando solamente el contenido seguro.";
 
 function App() {
-  const [mode, setMode] = useState<Mode>("VAULT");
   const [text, setText] = useState(samples.confidential);
   const [specificRequest, setSpecificRequest] = useState(defaultRequest);
   const [analysis, setAnalysis] = useState<PrivacyAnalysis | null>(null);
@@ -120,6 +139,7 @@ function App() {
   const [memoryAskStatus, setMemoryAskStatus] = useState<"idle" | "running" | "done" | "error">("idle");
   const [memoryItems, setMemoryItems] = useState<MemoryDashboardItem[]>([]);
   const [selectedMemory, setSelectedMemory] = useState<MemoryDetail | null>(null);
+  const [lastRemembered, setLastRemembered] = useState<RememberedTranscript | null>(null);
   const [memoryListStatus, setMemoryListStatus] = useState<"idle" | "running" | "done" | "error">("idle");
   const [memorySearch, setMemorySearch] = useState("");
 
@@ -139,10 +159,24 @@ function App() {
     ];
   }, [analysis]);
 
+  const activeTicketSegments = useMemo(() => {
+    if (memoryAnswer) {
+      return memoryAnswer.sources.flatMap((source) => source.task_segments);
+    }
+    if (selectedMemory) {
+      return selectedMemory.task_segments;
+    }
+    if (lastRemembered) {
+      return lastRemembered.task_segments;
+    }
+    return memoryItems.flatMap((item) => item.task_segments);
+  }, [lastRemembered, memoryAnswer, memoryItems, selectedMemory]);
+
   async function analyze() {
     setStatus("running");
     setError(null);
     setExternalResponse(null);
+    setLastRemembered(null);
 
     try {
       let privacy: PrivacyAnalysis;
@@ -157,6 +191,7 @@ function App() {
         }
         const remembered = (await memoryResponse.json()) as RememberedTranscript;
         privacy = remembered.analysis;
+        setLastRemembered(remembered);
         setMemoryStatus(`Saved: ${remembered.title} (${remembered.chunk_count})`);
         await loadMemoryItems();
       } else {
@@ -170,27 +205,26 @@ function App() {
         }
         privacy = (await privacyResponse.json()) as PrivacyAnalysis;
         setMemoryStatus(null);
+        setLastRemembered(null);
       }
       setAnalysis(privacy);
 
-      if (mode === "INTELLIGENCE") {
-        const purpose = specificRequest.trim() || defaultRequest;
-        const aiResponse = await fetch(`${API_BASE}/api/ai/analyze-safe-content`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            safe_content: privacy.safe_content,
-            session_id: privacy.session_id,
-            purpose,
-            mode,
-          }),
-        });
-        if (!aiResponse.ok) {
-          throw new Error(`External analysis failed: ${aiResponse.status}`);
-        }
-        const payload = await aiResponse.json();
-        setExternalResponse(payload.reconstructed_response);
+      const purpose = specificRequest.trim() || defaultRequest;
+      const aiResponse = await fetch(`${API_BASE}/api/ai/analyze-safe-content`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          safe_content: privacy.safe_content,
+          session_id: privacy.session_id,
+          purpose,
+          mode: SYSTEM_MODE,
+        }),
+      });
+      if (!aiResponse.ok) {
+        throw new Error(`External analysis failed: ${aiResponse.status}`);
       }
+      const payload = await aiResponse.json();
+      setExternalResponse(payload.reconstructed_response);
 
       setStatus("done");
     } catch (err) {
@@ -226,6 +260,7 @@ function App() {
         throw new Error(`Memory detail failed: ${response.status}`);
       }
       setSelectedMemory((await response.json()) as MemoryDetail);
+      setMemoryAnswer(null);
       setMemoryListStatus("done");
     } catch (err) {
       setMemoryListStatus("error");
@@ -256,11 +291,12 @@ function App() {
     }
     setMemoryAskStatus("running");
     setError(null);
+    setSelectedMemory(null);
     try {
       const response = await fetch(`${API_BASE}/api/memory/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: memoryQuestion, mode, limit: 6 }),
+        body: JSON.stringify({ question: memoryQuestion, mode: SYSTEM_MODE, limit: 6 }),
       });
       if (!response.ok) {
         throw new Error(`Memory question failed: ${response.status}`);
@@ -280,19 +316,6 @@ function App() {
         <div>
           <p className="eyebrow">NVIDIA Jetson Orin Nano privacy gateway</p>
           <h1>Sentinel</h1>
-        </div>
-        <div className="mode-switch" role="tablist" aria-label="System mode">
-          {(["VAULT", "INTELLIGENCE"] as Mode[]).map((item) => (
-            <button
-              key={item}
-              className={mode === item ? "active" : ""}
-              onClick={() => setMode(item)}
-              role="tab"
-              aria-selected={mode === item}
-            >
-              {item === "VAULT" ? "Vault Mode" : "Intelligence Mode"}
-            </button>
-          ))}
         </div>
       </header>
 
@@ -318,7 +341,7 @@ function App() {
           </label>
           <div className="action-row">
             <button className="primary" onClick={analyze} disabled={status === "running" || !text.trim()}>
-              {status === "running" ? "Analyzing" : "Analyze locally"}
+              {status === "running" ? "Analyzing" : "Analyze with API"}
             </button>
             <span className={`status ${status}`}>{status}</span>
             {memoryStatus && <span className="memory-save-status">{memoryStatus}</span>}
@@ -332,6 +355,7 @@ function App() {
             <span>Remember transcript</span>
           </label>
           {error && <p className="error">{error}</p>}
+          <LocalAnalysisPanel remembered={lastRemembered} />
         </div>
 
         <aside className="report-panel">
@@ -370,22 +394,59 @@ function App() {
             <span className={`status ${memoryAskStatus}`}>{memoryAskStatus}</span>
           </div>
         </div>
-        <div className="memory-grid">
-          <label className="prompt-block memory-question">
-            <span>Memory Question</span>
-            <textarea
-              className="prompt-input"
-              value={memoryQuestion}
-              onChange={(event) => setMemoryQuestion(event.target.value)}
-              spellCheck={false}
-            />
-          </label>
-          <div className="memory-actions">
-            <button className="primary" onClick={askMemory} disabled={memoryAskStatus === "running" || !memoryQuestion.trim()}>
-              {memoryAskStatus === "running" ? "Searching" : "Ask memory"}
-            </button>
+
+        <div className="memory-operating-grid">
+          <div className="chat-console">
+            <div className="chat-frame request-frame">
+              <div className="frame-head">
+                <span>Chat Request</span>
+                <strong>API</strong>
+              </div>
+              <textarea
+                className="prompt-input chat-input"
+                value={memoryQuestion}
+                onChange={(event) => setMemoryQuestion(event.target.value)}
+                spellCheck={false}
+              />
+              <div className="chat-actions">
+                <button
+                  className="primary"
+                  onClick={askMemory}
+                  disabled={memoryAskStatus === "running" || !memoryQuestion.trim()}
+                >
+                  {memoryAskStatus === "running" ? "Searching" : "Ask memory"}
+                </button>
+                <span className={`status ${memoryAskStatus}`}>{memoryAskStatus}</span>
+              </div>
+            </div>
+
+            <div className="chat-frame response-frame">
+              <div className="frame-head">
+                <span>Chat Response</span>
+                <strong>{memoryAnswer ? `${memoryAnswer.sources.length} sources` : "waiting"}</strong>
+              </div>
+              {memoryAnswer ? (
+                <>
+                  <pre>{memoryAnswer.answer}</pre>
+                  <div className="evidence-strip">
+                    {memoryAnswer.sources.map((source) => (
+                      <div className="evidence-item" key={source.chunk_id}>
+                        <strong>{source.title}</strong>
+                        <span>Score {source.score.toFixed(2)}</span>
+                        <p>{source.snippet}</p>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <p className="empty-state">Ask a memory question to see the framed answer and evidence here.</p>
+              )}
+            </div>
           </div>
+
+          <TicketBoard segments={activeTicketSegments} />
         </div>
+
         <div className="memory-dashboard">
           <div className="memory-browser">
             <label className="memory-search">
@@ -408,6 +469,7 @@ function App() {
                   <small>
                     {item.tasks.length} tasks · {item.decisions.length} decisions · {item.risks.length} risks
                   </small>
+                  {item.areas.length > 0 && <small>{item.areas.map((area) => area.area).join(" · ")}</small>}
                 </button>
               ))}
               {memoryItems.length === 0 && <p className="empty-state">No memories saved yet.</p>}
@@ -430,7 +492,7 @@ function App() {
                 </div>
                 <div className="artifact-grid">
                   <Artifact title="Summary" items={[selectedMemory.summary]} />
-                  <Artifact title="Tasks" items={selectedMemory.tasks} />
+                  <Artifact title="Areas" items={selectedMemory.areas.map(formatArea)} />
                   <Artifact title="Decisions" items={selectedMemory.decisions} />
                   <Artifact title="Risks" items={selectedMemory.risks} />
                 </div>
@@ -450,23 +512,6 @@ function App() {
             )}
           </div>
         </div>
-        {memoryAnswer && (
-          <div className="memory-output">
-            <div>
-              <h2>Memory Answer</h2>
-              <pre>{memoryAnswer.answer}</pre>
-            </div>
-            <div className="source-list">
-              {memoryAnswer.sources.map((source) => (
-                <div className="source-item" key={source.chunk_id}>
-                  <strong>{source.title}</strong>
-                  <span>Score {source.score.toFixed(1)}</span>
-                  <pre>{source.snippet}</pre>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
       </section>
 
       <section className="comparison">
@@ -536,17 +581,142 @@ function Artifact({ title, items }: { title: string; items: string[] }) {
   );
 }
 
+function LocalAnalysisPanel({ remembered }: { remembered: RememberedTranscript | null }) {
+  if (!remembered) {
+    return null;
+  }
+
+  return (
+    <section className="local-analysis-panel">
+      <div className="frame-head">
+        <span>Local Analysis</span>
+        <strong>{remembered.chunk_count} chunks</strong>
+      </div>
+      <div className="artifact-grid local-artifacts">
+        <Artifact title="Summary" items={[remembered.summary]} />
+        <Artifact title="Areas" items={remembered.areas.map(formatArea)} />
+        <Artifact title="Decisions" items={remembered.decisions} />
+        <Artifact title="Risks" items={remembered.risks} />
+      </div>
+      <TicketBoard segments={remembered.task_segments} emptyText="No routed TO DO detected in this transcript." />
+    </section>
+  );
+}
+
+function TicketBoard({
+  segments,
+  emptyText = "Select a memory with tasks or ask a question that retrieves task-bearing sources.",
+}: {
+  segments: TaskSegment[];
+  emptyText?: string;
+}) {
+  const groups = ticketGroupsFromSegments(segments);
+  const totalTodos = groups.reduce(
+    (total, group) => total + group.divisions.reduce((subtotal, division) => subtotal + division.todos.length, 0),
+    0,
+  );
+
+  return (
+    <section className="ticket-board">
+      <div className="ticket-head">
+        <div>
+          <span>Ticket Routing</span>
+          <h2>Areas, Divisions & TO DO</h2>
+        </div>
+        <strong>{totalTodos} TO DO</strong>
+      </div>
+      {groups.length ? (
+        <div className="ticket-area-grid">
+          {groups.map((group) => (
+            <div className="ticket-area" key={group.area}>
+              <div className="ticket-area-head">
+                <strong>{group.area}</strong>
+                <span>{group.divisions.length} divisions</span>
+              </div>
+              {group.divisions.map((division) => (
+                <div className="ticket-division" key={`${group.area}-${division.role}`}>
+                  <h3>{division.role}</h3>
+                  <ol>
+                    {division.todos.map((todo) => (
+                      <li key={todo.id}>
+                        <span>{todo.id}</span>
+                        <p>{todo.description}</p>
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="empty-state">{emptyText}</p>
+      )}
+    </section>
+  );
+}
+
 function filteredMemoryItems(items: MemoryDashboardItem[], query: string) {
   const needle = query.trim().toLowerCase();
   if (!needle) {
     return items;
   }
   return items.filter((item) =>
-    [item.title, item.summary, ...item.tasks, ...item.decisions, ...item.risks]
+    [
+      item.title,
+      item.summary,
+      ...item.tasks,
+      ...item.decisions,
+      ...item.risks,
+      ...item.areas.map((area) => area.area),
+      ...item.task_segments.map((segment) => `${segment.role} ${segment.area} ${segment.description}`),
+    ]
       .join(" ")
       .toLowerCase()
       .includes(needle),
   );
+}
+
+function ticketGroupsFromSegments(segments: TaskSegment[]) {
+  const seen = new Set<string>();
+  const groups = new Map<string, Map<string, { id: string; description: string; confidence: number }[]>>();
+
+  segments.forEach((segment) => {
+    const area = segment.area || "General";
+    const role = segment.role || "General / Sin asignar";
+    const description = segment.description.trim();
+    if (!description) {
+      return;
+    }
+    const key = `${area}|${role}|${description}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    if (!groups.has(area)) {
+      groups.set(area, new Map());
+    }
+    const divisions = groups.get(area)!;
+    if (!divisions.has(role)) {
+      divisions.set(role, []);
+    }
+    const todoIndex = seen.size.toString().padStart(2, "0");
+    divisions.get(role)!.push({
+      id: `T-${todoIndex}`,
+      description,
+      confidence: segment.confidence,
+    });
+  });
+
+  return Array.from(groups.entries()).map(([area, divisions]) => ({
+    area,
+    divisions: Array.from(divisions.entries()).map(([role, todos]) => ({ role, todos })),
+  }));
+}
+
+function formatArea(area: EnterpriseArea) {
+  const evidence = area.evidence.length ? ` · ${area.evidence.slice(0, 4).join(", ")}` : "";
+  return `${area.area} (${Math.round(area.score * 100)}%)${evidence}`;
 }
 
 function titleFromText(value: string) {

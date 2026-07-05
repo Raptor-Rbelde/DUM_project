@@ -21,11 +21,11 @@ The Jetson device is the privacy boundary. Enterprise data remains local by defa
 - Logs containing secrets or full restricted payloads.
 - Frontend exposure of provider API keys.
 - Direct provider calls bypassing the Cloud Gateway.
-- Internet unavailability during Vault Mode.
+- Internet or provider unavailability during API-backed intelligence.
 
 ## MVP Controls
 
-- Vault Mode blocks all provider calls.
+- API-backed intelligence validates safe payloads before any provider call.
 - `EXTERNAL_AI_ENABLED=false` by default.
 - Provider API keys are read only from environment variables.
 - Secret-like values are classified as `RESTRICTED` and blocked.

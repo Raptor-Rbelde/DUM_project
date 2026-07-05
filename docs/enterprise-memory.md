@@ -60,10 +60,9 @@ Read memory counts:
 GET /api/memory/status
 ```
 
-## Modes
+## API Intelligence
 
-- `VAULT`: retrieves and reconstructs local memory snippets without calling an external provider.
-- `INTELLIGENCE`: sends only safe retrieved snippets to the configured external provider, then reconstructs authorized placeholders locally.
+The web app uses `INTELLIGENCE` for memory questions. Sentinel retrieves safe memory snippets locally, validates them, sends only the safe context to the configured external provider, then reconstructs authorized placeholders locally.
 
 This makes Sentinel behave like a growing enterprise assistant: the more meetings it remembers, the more context it can retrieve for future questions.
 

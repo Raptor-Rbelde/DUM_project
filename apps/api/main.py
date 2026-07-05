@@ -32,7 +32,7 @@ class CreateMeetingRequest(BaseModel):
 
 
 class AnalyzeMeetingRequest(BaseModel):
-    mode: SystemMode = SystemMode.VAULT
+    mode: SystemMode = SystemMode.INTELLIGENCE
     purpose: str = "Generate local meeting intelligence from a safe payload."
 
 
@@ -40,7 +40,7 @@ class AnalyzeSafeContentRequest(BaseModel):
     safe_content: str = Field(min_length=1)
     session_id: str
     purpose: str
-    mode: SystemMode = SystemMode.VAULT
+    mode: SystemMode = SystemMode.INTELLIGENCE
 
 
 class RememberTranscriptRequest(BaseModel):
@@ -51,7 +51,7 @@ class RememberTranscriptRequest(BaseModel):
 
 class AskMemoryRequest(BaseModel):
     question: str = Field(min_length=1)
-    mode: SystemMode = SystemMode.VAULT
+    mode: SystemMode = SystemMode.INTELLIGENCE
     limit: int = Field(default=6, ge=1, le=12)
 
 
@@ -92,7 +92,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def system_status() -> dict[str, object]:
         return {
             "system": "sentinel",
-            "default_mode": SystemMode.VAULT.value,
+            "default_mode": SystemMode.INTELLIGENCE.value,
             "external_ai_enabled": app_settings.external_ai_enabled,
             "local_ml_enabled": app_settings.local_ml_enabled,
             "local_ml_model_path": str(Path(app_settings.local_ml_model_path)),

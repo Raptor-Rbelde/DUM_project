@@ -82,28 +82,6 @@ h2 {
   font-size: 1rem;
 }
 
-.mode-switch {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  min-width: 360px;
-  height: 44px;
-  border: 1px solid #313c48;
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.mode-switch button {
-  border: 0;
-  border-radius: 0;
-  background: #10151a;
-  color: #93a3b0;
-}
-
-.mode-switch button.active {
-  background: #d6e3ee;
-  color: #0b0d10;
-}
-
 .workspace {
   display: grid;
   grid-template-columns: minmax(0, 1.7fr) minmax(320px, 0.8fr);
@@ -243,6 +221,33 @@ input {
   font-size: 0.82rem;
 }
 
+.local-analysis-panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  border: 1px solid #34443f;
+  border-radius: 8px;
+  background: #0b0e12;
+  padding: 14px;
+}
+
+.local-artifacts {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.local-artifacts .artifact {
+  min-height: 96px;
+}
+
+.local-analysis-panel .ticket-board {
+  min-height: 0;
+  background: #090c10;
+}
+
+.local-analysis-panel .ticket-area-grid {
+  max-height: 260px;
+}
+
 .memory-head-actions {
   display: flex;
   align-items: center;
@@ -373,6 +378,201 @@ pre {
   min-height: 92px;
 }
 
+.memory-operating-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(320px, 0.92fr);
+  gap: 16px;
+  align-items: stretch;
+}
+
+.chat-console {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.85fr) minmax(0, 1.15fr);
+  gap: 12px;
+}
+
+.chat-frame,
+.ticket-board {
+  border: 1px solid #293440;
+  border-radius: 8px;
+  background: #0b0e12;
+  padding: 14px;
+  min-height: 250px;
+}
+
+.request-frame {
+  border-color: #34443f;
+}
+
+.response-frame {
+  border-color: #3a4652;
+}
+
+.frame-head,
+.ticket-head,
+.ticket-area-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.frame-head span,
+.ticket-head span {
+  color: #98a6b2;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+.frame-head strong,
+.ticket-head strong,
+.ticket-area-head span {
+  color: #c9d6df;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.chat-input {
+  min-height: 142px;
+}
+
+.chat-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.response-frame pre {
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid #202a33;
+  border-radius: 6px;
+  padding: 10px;
+  background: #090c10;
+}
+
+.evidence-strip {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.evidence-item {
+  border-left: 3px solid #6fa6a2;
+  background: #0f1519;
+  padding: 9px 10px;
+}
+
+.evidence-item strong,
+.evidence-item span {
+  display: block;
+}
+
+.evidence-item strong {
+  font-size: 0.84rem;
+}
+
+.evidence-item span {
+  margin-top: 3px;
+  color: #98a6b2;
+  font-size: 0.74rem;
+}
+
+.evidence-item p {
+  margin: 6px 0 0;
+  color: #c9d4dc;
+  font-size: 0.8rem;
+  line-height: 1.38;
+}
+
+.ticket-board {
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.ticket-head {
+  border-bottom: 1px solid #202a33;
+  padding-bottom: 10px;
+}
+
+.ticket-head h2 {
+  margin-top: 4px;
+}
+
+.ticket-area-grid {
+  display: grid;
+  gap: 10px;
+  max-height: 530px;
+  overflow: auto;
+}
+
+.ticket-area {
+  border: 1px solid #24303a;
+  border-radius: 8px;
+  background: #10161b;
+  padding: 11px;
+}
+
+.ticket-area-head {
+  margin-bottom: 8px;
+}
+
+.ticket-area-head strong {
+  color: #e7edf2;
+}
+
+.ticket-division {
+  border-top: 1px solid #25313b;
+  padding-top: 9px;
+  margin-top: 9px;
+}
+
+.ticket-division h3 {
+  margin: 0 0 8px;
+  color: #b9c9d3;
+  font-size: 0.86rem;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.ticket-division ol {
+  display: grid;
+  gap: 7px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.ticket-division li {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.ticket-division li span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 26px;
+  border: 1px solid #40515f;
+  border-radius: 999px;
+  color: #d4e4ec;
+  font-size: 0.72rem;
+}
+
+.ticket-division li p {
+  margin: 3px 0 0;
+  color: #dce5eb;
+  font-size: 0.84rem;
+  line-height: 1.42;
+}
+
 .memory-output {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(280px, 0.55fr);
@@ -386,7 +586,7 @@ pre {
   display: grid;
   grid-template-columns: minmax(260px, 0.42fr) minmax(0, 1fr);
   gap: 18px;
-  margin-top: 18px;
+  margin-top: 16px;
   border-top: 1px solid #24303a;
   padding-top: 18px;
 }
@@ -598,8 +798,11 @@ pre {
   .workspace,
   .comparison,
   .memory-grid,
+  .memory-operating-grid,
+  .chat-console,
   .memory-output,
   .memory-dashboard,
+  .ticket-area-grid,
   .memory-transcripts,
   .artifact-grid {
     grid-template-columns: 1fr;
@@ -610,8 +813,4 @@ pre {
     align-items: start;
   }
 
-  .mode-switch {
-    min-width: 0;
-    width: 100%;
-  }
 }

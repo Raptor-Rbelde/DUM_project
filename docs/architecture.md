@@ -8,7 +8,7 @@ Sentinel is a modular monolith designed to run locally on an NVIDIA Jetson Orin 
 - `sentinel.privacy`: detection, policy, pseudonymization, and reconstruction.
 - `sentinel.audit`: local audit event store with payload fingerprints, never raw secrets.
 - `sentinel.meetings`: meeting persistence and analysis orchestration.
-- `sentinel.tasks`: local heuristic summary, task, and decision extraction.
+- `sentinel.tasks`: local summary, task, decision, risk, enterprise-area, and role segmentation extraction.
 - `sentinel.db`: versioned SQLite schema for local persistence and vector tables.
 - `sentinel.memory`: enterprise memory, local embeddings, hybrid vector retrieval, and question answering.
 - `sentinel.providers`: provider interfaces, OpenAI adapter, and Cloud Gateway.
@@ -36,7 +36,7 @@ CloudGateway -> PrivacyPolicy -> SafePayloadValidator -> ProviderAdapter
 
 ## Detection Strategy
 
-The current MVP uses deterministic local detectors with explicit priority rules. The next hardening step is a hybrid detector: deterministic rules for secrets and a local ML named-entity-recognition model for names, organizations, dates, clients, and internal projects. See `docs/local-ml-detector.md`.
+The current MVP uses deterministic rules plus local ML-style models. Privacy detection combines rules for secrets with a local sequence tagger. Enterprise context classification uses local embeddings/prototypes to detect business areas and segment tasks by role. See `docs/local-ml-detector.md` and `docs/enterprise-area-classifier.md`.
 
 ## Persistence
 

@@ -26,7 +26,22 @@ class MemorySource(BaseModel):
     tasks: list[str]
     decisions: list[str]
     risks: list[str]
+    areas: list["EnterpriseAreaInsight"]
+    task_segments: list["TaskSegmentInsight"]
     created_at: str
+
+
+class EnterpriseAreaInsight(BaseModel):
+    area: str
+    score: float
+    evidence: list[str] = []
+
+
+class TaskSegmentInsight(BaseModel):
+    description: str
+    area: str
+    role: str
+    confidence: float
 
 
 class RememberedTranscript(BaseModel):
@@ -37,6 +52,8 @@ class RememberedTranscript(BaseModel):
     tasks: list[str]
     decisions: list[str]
     risks: list[str]
+    areas: list[EnterpriseAreaInsight]
+    task_segments: list[TaskSegmentInsight]
     analysis: PrivacyAnalysis
 
 
@@ -50,6 +67,8 @@ class MemoryDashboardItem(BaseModel):
     tasks: list[str]
     decisions: list[str]
     risks: list[str]
+    areas: list[EnterpriseAreaInsight]
+    task_segments: list[TaskSegmentInsight]
     risk_level: str
     entities: int
     chunks: int | None = None
@@ -98,6 +117,8 @@ class MemoryService:
         tasks = [task.description for task in self.extractor.extract_tasks(analysis.safe_content)]
         decisions = [decision.description for decision in self.extractor.extract_decisions(analysis.safe_content)]
         risks = [risk.description for risk in self.extractor.extract_risks(analysis.safe_content)]
+        areas = [_area_dict(area) for area in self.extractor.classify_areas(analysis.safe_content)]
+        task_segments = self._segment_safe_tasks(tasks)
         item = self.memory_store.save_item(
             memory_id=item_id,
             title=clean_title,
@@ -108,6 +129,8 @@ class MemoryService:
             tasks=tasks,
             decisions=decisions,
             risks=risks,
+            areas=areas,
+            task_segments=task_segments,
             source=source,
         )
         chunks = self.memory_store.replace_chunks(item.id, _paired_chunks(transcript, analysis.safe_content))
@@ -125,6 +148,7 @@ class MemoryService:
                 "tasks": len(tasks),
                 "decisions": len(decisions),
                 "risks": len(risks),
+                "areas": [area["area"] for area in areas],
             },
         )
         return RememberedTranscript(
@@ -135,6 +159,8 @@ class MemoryService:
             tasks=[self.privacy_engine.reconstruct(task) for task in tasks],
             decisions=[self.privacy_engine.reconstruct(decision) for decision in decisions],
             risks=[self.privacy_engine.reconstruct(risk) for risk in risks],
+            areas=[EnterpriseAreaInsight(**area) for area in areas],
+            task_segments=[self._reconstructed_task_segment(segment) for segment in task_segments],
             analysis=analysis,
         )
 
@@ -237,6 +263,7 @@ class MemoryService:
     def _dashboard_item(self, item: MemoryItem) -> MemoryDashboardItem:
         report = item.privacy_report
         counts = report.get("counts", {})
+        artifacts = self._artifacts_for_safe_text(item.safe_content)
         return MemoryDashboardItem(
             memory_id=item.id,
             title=item.title,
@@ -244,14 +271,65 @@ class MemoryService:
             created_at=item.created_at,
             updated_at=item.updated_at,
             summary=self.privacy_engine.reconstruct(item.summary),
-            tasks=[self.privacy_engine.reconstruct(task) for task in item.tasks],
-            decisions=[self.privacy_engine.reconstruct(decision) for decision in item.decisions],
-            risks=[self.privacy_engine.reconstruct(risk) for risk in item.risks],
+            tasks=[self.privacy_engine.reconstruct(task) for task in artifacts["tasks"]],
+            decisions=[self.privacy_engine.reconstruct(decision) for decision in artifacts["decisions"]],
+            risks=[self.privacy_engine.reconstruct(risk) for risk in artifacts["risks"]],
+            areas=[EnterpriseAreaInsight(**area) for area in artifacts["areas"]],
+            task_segments=[self._reconstructed_task_segment(segment) for segment in artifacts["task_segments"]],
             risk_level=str(report.get("risk_level", "LOW")),
             entities=int(counts.get("total_entities", 0) or 0),
         )
 
+    def _areas_for_item(self, item: MemoryItem) -> list[dict]:
+        if item.areas:
+            return item.areas
+        return [_area_dict(area) for area in self.extractor.classify_areas(item.safe_content)]
+
+    def _task_segments_for_item(self, item: MemoryItem) -> list[dict]:
+        if item.task_segments:
+            return item.task_segments
+        return [_task_segment_dict(segment) for segment in self.extractor.segment_tasks(item.tasks)]
+
+    def _artifacts_for_safe_text(self, safe_text: str) -> dict[str, list]:
+        tasks = [task.description for task in self.extractor.extract_tasks(safe_text)]
+        decisions = [decision.description for decision in self.extractor.extract_decisions(safe_text)]
+        risks = [risk.description for risk in self.extractor.extract_risks(safe_text)]
+        areas = [_area_dict(area) for area in self.extractor.classify_areas(safe_text)]
+        task_segments = self._segment_safe_tasks(tasks)
+        return {
+            "tasks": tasks,
+            "decisions": decisions,
+            "risks": risks,
+            "areas": areas,
+            "task_segments": task_segments,
+        }
+
+    def _segment_safe_tasks(self, tasks: list[str]) -> list[dict]:
+        segments: list[dict] = []
+        for safe_task in tasks:
+            classifier_input = self.privacy_engine.reconstruct(safe_task)
+            segment = self.extractor.area_classifier.segment_task(classifier_input)
+            segments.append(
+                {
+                    "description": safe_task,
+                    "area": segment.area,
+                    "role": segment.role,
+                    "confidence": segment.confidence,
+                }
+            )
+        return segments
+
+    def _reconstructed_task_segment(self, segment: dict) -> TaskSegmentInsight:
+        clean = {
+            "description": self.privacy_engine.reconstruct(str(segment.get("description", ""))),
+            "area": str(segment.get("area", "General")),
+            "role": str(segment.get("role", "General / Sin asignar")),
+            "confidence": float(segment.get("confidence", 0.0) or 0.0),
+        }
+        return TaskSegmentInsight(**clean)
+
     def _source_from_result(self, result: MemorySearchResult) -> MemorySource:
+        artifacts = self._artifacts_for_safe_text(result.chunk.safe_text)
         return MemorySource(
             memory_id=result.item.id,
             title=result.item.title,
@@ -260,28 +338,45 @@ class MemoryService:
             snippet=self.privacy_engine.reconstruct(result.chunk.safe_text),
             safe_snippet=result.chunk.safe_text,
             summary=self.privacy_engine.reconstruct(result.item.summary),
-            tasks=[self.privacy_engine.reconstruct(task) for task in result.item.tasks],
-            decisions=[self.privacy_engine.reconstruct(decision) for decision in result.item.decisions],
-            risks=[self.privacy_engine.reconstruct(risk) for risk in result.item.risks],
+            tasks=[self.privacy_engine.reconstruct(task) for task in artifacts["tasks"]],
+            decisions=[self.privacy_engine.reconstruct(decision) for decision in artifacts["decisions"]],
+            risks=[self.privacy_engine.reconstruct(risk) for risk in artifacts["risks"]],
+            areas=[EnterpriseAreaInsight(**area) for area in artifacts["areas"]],
+            task_segments=[self._reconstructed_task_segment(segment) for segment in artifacts["task_segments"]],
             created_at=result.item.created_at,
         )
 
     def _safe_context(self, results: list[MemorySearchResult], *, safe_question: str) -> str:
+        aggregate = self._aggregate_artifacts(results)
         lines = [
             "Enterprise memory question:",
             safe_question,
+            "",
+            "Aggregate structured memory facts across all retrieved snippets:",
+            f"Tasks: {_format_list(aggregate['tasks'])}",
+            f"Areas: {_format_area_list(aggregate['areas'])}",
+            f"Task Segments: {_format_task_segment_list(aggregate['task_segments'])}",
+            f"Decisions: {_format_list(aggregate['decisions'])}",
+            f"Risks: {_format_list(aggregate['risks'])}",
+            "",
+            "Consistency rule: the aggregate structured memory facts above are authoritative. "
+            "If Tasks or Task Segments are not None, do not answer that no tasks are registered. "
+            "If Decisions or Risks are not None, include them instead of saying they are absent.",
             "",
             "Relevant safe memory records:",
         ]
         for index, result in enumerate(results, start=1):
             safe_title = self.privacy_engine.sanitize_text(result.item.title, session_id=result.item.id)
+            artifacts = self._artifacts_for_safe_text(result.chunk.safe_text)
             lines.extend(
                 [
                     f"[Source {index}] memory_id={result.item.id} title={safe_title} score={result.score:.2f}",
                     f"Summary: {result.item.summary}",
-                    f"Tasks: {_format_list(result.item.tasks)}",
-                    f"Decisions: {_format_list(result.item.decisions)}",
-                    f"Risks: {_format_list(result.item.risks)}",
+                    f"Tasks in snippet: {_format_list(artifacts['tasks'])}",
+                    f"Areas in snippet: {_format_area_list(artifacts['areas'])}",
+                    f"Task Segments in snippet: {_format_task_segment_list(artifacts['task_segments'])}",
+                    f"Decisions in snippet: {_format_list(artifacts['decisions'])}",
+                    f"Risks in snippet: {_format_list(artifacts['risks'])}",
                     "Snippet:",
                     result.chunk.safe_text,
                     "",
@@ -294,6 +389,46 @@ class MemoryService:
             "circunstancia, detente, and cero bloqueos are decisive evidence."
         )
         return "\n".join(lines)
+
+    def _aggregate_artifacts(self, results: list[MemorySearchResult]) -> dict[str, list]:
+        aggregate: dict[str, list] = {
+            "tasks": [],
+            "decisions": [],
+            "risks": [],
+            "areas": [],
+            "task_segments": [],
+        }
+        seen_text: dict[str, set[str]] = {"tasks": set(), "decisions": set(), "risks": set()}
+        seen_areas: set[str] = set()
+        seen_segments: set[tuple[str, str, str]] = set()
+
+        for result in results:
+            artifacts = self._artifacts_for_safe_text(result.chunk.safe_text)
+            for key in ("tasks", "decisions", "risks"):
+                for value in artifacts[key]:
+                    clean = str(value).strip()
+                    if clean and clean not in seen_text[key]:
+                        seen_text[key].add(clean)
+                        aggregate[key].append(clean)
+            for area in artifacts["areas"]:
+                if not isinstance(area, dict):
+                    continue
+                area_name = str(area.get("area", "")).strip()
+                if area_name and area_name not in seen_areas:
+                    seen_areas.add(area_name)
+                    aggregate["areas"].append(area)
+            for segment in artifacts["task_segments"]:
+                if not isinstance(segment, dict):
+                    continue
+                signature = (
+                    str(segment.get("area", "")),
+                    str(segment.get("role", "")),
+                    str(segment.get("description", "")),
+                )
+                if signature[2] and signature not in seen_segments:
+                    seen_segments.add(signature)
+                    aggregate["task_segments"].append(segment)
+        return aggregate
 
     def _sanitize_question_for_results(self, question: str, results: list[MemorySearchResult]) -> str:
         sanitized = question
@@ -314,8 +449,23 @@ class MemoryService:
         wants_decisions = any(term in question_lower for term in ("decision", "decisión", "acuerdo", "aprobo", "aprobó"))
         wants_risks = any(term in question_lower for term in ("riesgo", "bloqueo", "incidente", "critico", "crítico"))
         wants_summary = any(term in question_lower for term in ("resumen", "contexto", "que paso", "qué pasó"))
+        wants_areas = any(
+            term in question_lower
+            for term in ("area", "área", "departamento", "rol", "roles", "segment", "segmenta", "equipo")
+        )
 
         sections: list[str] = []
+        if wants_areas:
+            areas = _unique(area.area for source in sources for area in source.areas)
+            task_segments = _unique(
+                f"{segment.role} ({segment.area}): {segment.description}"
+                for source in sources
+                for segment in source.task_segments
+            )
+            if areas:
+                sections.append("Areas detectadas:\n" + "\n".join(f"- {item}" for item in areas[:8]))
+            if task_segments:
+                sections.append("Tareas por rol:\n" + "\n".join(f"- {item}" for item in task_segments[:10]))
         if wants_summary:
             summaries = _unique(source.summary for source in sources if source.summary)
             if summaries:
@@ -444,6 +594,42 @@ def _split_long_text(text: str, max_chars: int) -> list[str]:
 
 def _format_list(items: list[str]) -> str:
     return "; ".join(items) if items else "None"
+
+
+def _format_area_list(items: list[dict]) -> str:
+    if not items:
+        return "None"
+    return "; ".join(str(item.get("area", "General")) for item in items if isinstance(item, dict))
+
+
+def _format_task_segment_list(items: list[dict]) -> str:
+    if not items:
+        return "None"
+    segments = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        segments.append(
+            f"{item.get('role', 'General / Sin asignar')} ({item.get('area', 'General')}): {item.get('description', '')}"
+        )
+    return "; ".join(segments) if segments else "None"
+
+
+def _area_dict(area) -> dict:
+    return {
+        "area": area.area,
+        "score": area.score,
+        "evidence": list(area.evidence),
+    }
+
+
+def _task_segment_dict(segment) -> dict:
+    return {
+        "description": segment.description,
+        "area": segment.area,
+        "role": segment.role,
+        "confidence": segment.confidence,
+    }
 
 
 def _unique(items) -> list[str]:

@@ -84,7 +84,7 @@ class CloudGateway:
         *,
         purpose: str,
         session_id: str,
-        mode: SystemMode = SystemMode.VAULT,
+        mode: SystemMode = SystemMode.INTELLIGENCE,
     ) -> ExternalAIResult:
         provider_name = getattr(self.provider, "name", "unknown")
         self.audit_store.record(

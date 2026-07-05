@@ -6,7 +6,7 @@ Sentinel is a local-first privacy gateway MVP for meeting intelligence on Jetson
 2. Analyze it locally with the Sentinel Privacy Engine.
 3. Detect sensitive entities, secrets, dates, money, clients, and identities.
 4. Block restricted data, pseudonymize confidential data, and minimize internal data.
-5. Produce a safe payload for optional Intelligence Mode.
+5. Send the safe payload to the configured external AI API for intelligence.
 6. Keep vault mappings and audit events local in SQLite.
 
 ## Repository Layout
@@ -21,11 +21,11 @@ tests           Privacy and gateway tests
 docs            Architecture, threat model, demo flow
 ```
 
-## Modes
+## API Intelligence
 
-Vault Mode is the default. It never calls an external provider.
+The web app runs in API-backed intelligence mode. Sentinel still performs privacy detection, redaction, pseudonymization, validation, vault mapping, and audit logging locally before any provider call.
 
-Intelligence Mode can call an external provider only when `EXTERNAL_AI_ENABLED=true`, a provider key is configured, the payload passes local validation, and the request has an explicit purpose.
+External AI calls are sent only when `EXTERNAL_AI_ENABLED=true`, a provider key is configured, the safe payload passes local validation, and the request has an explicit purpose.
 
 ## Local Setup
 

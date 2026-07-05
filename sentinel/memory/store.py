@@ -7,6 +7,7 @@ import sqlite3
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from sentinel.db.schema import connect_database, initialize_database
@@ -36,6 +37,8 @@ class MemoryItem:
     tasks: list[str]
     decisions: list[str]
     risks: list[str]
+    areas: list[dict[str, Any]]
+    task_segments: list[dict[str, Any]]
     source: str
     created_at: str
     updated_at: str
@@ -83,8 +86,12 @@ class PersistentMemoryStore:
         decisions: list[str],
         risks: list[str],
         source: str,
+        areas: list[dict[str, Any]] | None = None,
+        task_segments: list[dict[str, Any]] | None = None,
     ) -> MemoryItem:
         now = utc_now()
+        safe_areas = areas or []
+        safe_task_segments = task_segments or []
         with self._connect() as conn:
             existing = conn.execute("SELECT created_at FROM memory_items WHERE id = ?", (memory_id,)).fetchone()
             created_at = str(existing["created_at"]) if existing else now
@@ -92,10 +99,11 @@ class PersistentMemoryStore:
                 """
                 INSERT INTO memory_items (
                     id, title, transcript, safe_content, privacy_report_json,
-                    summary, tasks_json, decisions_json, risks_json,
+                    summary, tasks_json, decisions_json, risks_json, areas_json,
+                    task_segments_json,
                     source, content_hash, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title = excluded.title,
                     transcript = excluded.transcript,
@@ -105,6 +113,8 @@ class PersistentMemoryStore:
                     tasks_json = excluded.tasks_json,
                     decisions_json = excluded.decisions_json,
                     risks_json = excluded.risks_json,
+                    areas_json = excluded.areas_json,
+                    task_segments_json = excluded.task_segments_json,
                     source = excluded.source,
                     content_hash = excluded.content_hash,
                     updated_at = excluded.updated_at
@@ -119,6 +129,8 @@ class PersistentMemoryStore:
                     json.dumps(tasks, sort_keys=True),
                     json.dumps(decisions, sort_keys=True),
                     json.dumps(risks, sort_keys=True),
+                    json.dumps(safe_areas, sort_keys=True),
+                    json.dumps(safe_task_segments, sort_keys=True),
                     source,
                     _hash_text(transcript),
                     created_at,
@@ -135,6 +147,8 @@ class PersistentMemoryStore:
             tasks,
             decisions,
             risks,
+            safe_areas,
+            safe_task_segments,
             source,
             created_at,
             now,
@@ -236,6 +250,8 @@ class PersistentMemoryStore:
                     memory_items.tasks_json,
                     memory_items.decisions_json,
                     memory_items.risks_json,
+                    memory_items.areas_json,
+                    memory_items.task_segments_json,
                     memory_items.source,
                     memory_items.created_at AS item_created_at,
                     memory_items.updated_at
@@ -254,7 +270,16 @@ class PersistentMemoryStore:
             tasks = list(json.loads(str(row["tasks_json"])))
             decisions = list(json.loads(str(row["decisions_json"])))
             risks = list(json.loads(str(row["risks_json"])))
-            haystack = _search_haystack(row, tasks=tasks, decisions=decisions, risks=risks)
+            areas = _json_list(str(row["areas_json"]))
+            task_segments = _json_list(str(row["task_segments_json"]))
+            haystack = _search_haystack(
+                row,
+                tasks=tasks,
+                decisions=decisions,
+                risks=risks,
+                areas=areas,
+                task_segments=task_segments,
+            )
             lexical_score = _lexical_score(query, query_tokens, haystack)
             vector_score = cosine_similarity(query_vector, vector_from_json(str(row["vector_json"] or "[]")))
             score = (0.45 * lexical_score) + (0.55 * max(vector_score, 0.0))
@@ -272,6 +297,8 @@ class PersistentMemoryStore:
                 tasks=tasks,
                 decisions=decisions,
                 risks=risks,
+                areas=areas,
+                task_segments=task_segments,
                 source=str(row["source"]),
                 created_at=str(row["item_created_at"]),
                 updated_at=str(row["updated_at"]),
@@ -333,13 +360,23 @@ class PersistentMemoryStore:
             tasks=list(json.loads(str(row["tasks_json"]))),
             decisions=list(json.loads(str(row["decisions_json"]))),
             risks=list(json.loads(str(row["risks_json"]))),
+            areas=_json_list(str(row["areas_json"])),
+            task_segments=_json_list(str(row["task_segments_json"])),
             source=str(row["source"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )
 
 
-def _search_haystack(row, *, tasks: list[str], decisions: list[str], risks: list[str]) -> str:
+def _search_haystack(
+    row,
+    *,
+    tasks: list[str],
+    decisions: list[str],
+    risks: list[str],
+    areas: list[dict[str, Any]],
+    task_segments: list[dict[str, Any]],
+) -> str:
     artifact_terms: list[str] = []
     if tasks:
         artifact_terms.extend(["tarea", "tareas", "accion", "acciones", "pendiente", "responsable"])
@@ -356,9 +393,25 @@ def _search_haystack(row, *, tasks: list[str], decisions: list[str], risks: list
             " ".join(tasks),
             " ".join(decisions),
             " ".join(risks),
+            " ".join(str(area.get("area", "")) for area in areas if isinstance(area, dict)),
+            " ".join(
+                " ".join([str(segment.get("area", "")), str(segment.get("role", "")), str(segment.get("description", ""))])
+                for segment in task_segments
+                if isinstance(segment, dict)
+            ),
             " ".join(artifact_terms),
         ]
     )
+
+
+def _json_list(raw: str) -> list[dict[str, Any]]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
 
 
 def _lexical_score(query: str, query_tokens: set[str], haystack: str) -> float:
