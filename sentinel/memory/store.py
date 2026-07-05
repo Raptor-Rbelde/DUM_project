@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -8,10 +9,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from sentinel.db.schema import connect_database, initialize_database
 from sentinel.domain.meetings import utc_now
+from sentinel.memory.vectorizer import (
+    LOCAL_VECTOR_DIMENSIONS,
+    LOCAL_VECTOR_MODEL,
+    cosine_similarity,
+    embed_text,
+    vector_from_json,
+    vector_to_json,
+)
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_/-]{3,}")
+VECTOR_MATCH_THRESHOLD = 0.13
 
 
 @dataclass(frozen=True)
@@ -53,55 +64,11 @@ class PersistentMemoryStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _connect(self):
+        return connect_database(self.db_path)
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS memory_items (
-                    id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    transcript TEXT NOT NULL,
-                    safe_content TEXT NOT NULL,
-                    privacy_report_json TEXT NOT NULL,
-                    summary TEXT NOT NULL DEFAULT '',
-                    tasks_json TEXT NOT NULL DEFAULT '[]',
-                    decisions_json TEXT NOT NULL DEFAULT '[]',
-                    risks_json TEXT NOT NULL DEFAULT '[]',
-                    source TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS memory_chunks (
-                    id TEXT PRIMARY KEY,
-                    memory_id TEXT NOT NULL,
-                    chunk_index INTEGER NOT NULL,
-                    text TEXT NOT NULL,
-                    safe_text TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(memory_id) REFERENCES memory_items(id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_memory_chunks_memory_id ON memory_chunks(memory_id);
-                """
-            )
-            self._ensure_columns(conn)
-
-    @staticmethod
-    def _ensure_columns(conn: sqlite3.Connection) -> None:
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)").fetchall()}
-        migrations = {
-            "summary": "ALTER TABLE memory_items ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
-            "tasks_json": "ALTER TABLE memory_items ADD COLUMN tasks_json TEXT NOT NULL DEFAULT '[]'",
-            "decisions_json": "ALTER TABLE memory_items ADD COLUMN decisions_json TEXT NOT NULL DEFAULT '[]'",
-            "risks_json": "ALTER TABLE memory_items ADD COLUMN risks_json TEXT NOT NULL DEFAULT '[]'",
-        }
-        for column, statement in migrations.items():
-            if column not in columns:
-                conn.execute(statement)
+        initialize_database(self.db_path)
 
     def save_item(
         self,
@@ -126,9 +93,9 @@ class PersistentMemoryStore:
                 INSERT INTO memory_items (
                     id, title, transcript, safe_content, privacy_report_json,
                     summary, tasks_json, decisions_json, risks_json,
-                    source, created_at, updated_at
+                    source, content_hash, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title = excluded.title,
                     transcript = excluded.transcript,
@@ -139,6 +106,7 @@ class PersistentMemoryStore:
                     decisions_json = excluded.decisions_json,
                     risks_json = excluded.risks_json,
                     source = excluded.source,
+                    content_hash = excluded.content_hash,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -152,6 +120,7 @@ class PersistentMemoryStore:
                     json.dumps(decisions, sort_keys=True),
                     json.dumps(risks, sort_keys=True),
                     source,
+                    _hash_text(transcript),
                     created_at,
                     now,
                 ),
@@ -180,13 +149,45 @@ class PersistentMemoryStore:
                 chunk = MemoryChunk(str(uuid4()), memory_id, index, text, safe_text, now)
                 conn.execute(
                     """
-                    INSERT INTO memory_chunks (id, memory_id, chunk_index, text, safe_text, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO memory_chunks (
+                        id, memory_id, chunk_index, text, safe_text,
+                        token_count, content_hash, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (chunk.id, chunk.memory_id, chunk.chunk_index, chunk.text, chunk.safe_text, chunk.created_at),
+                    (
+                        chunk.id,
+                        chunk.memory_id,
+                        chunk.chunk_index,
+                        chunk.text,
+                        chunk.safe_text,
+                        len(_tokens(chunk.safe_text or chunk.text)),
+                        _hash_text(chunk.text),
+                        chunk.created_at,
+                    ),
                 )
+                self._upsert_embedding(conn, chunk.id, chunk.safe_text or chunk.text, now)
                 saved.append(chunk)
         return saved
+
+    def backfill_missing_embeddings(self) -> int:
+        now = utc_now()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT memory_chunks.id, memory_chunks.safe_text, memory_chunks.text, memory_embeddings.source_text_hash
+                FROM memory_chunks
+                LEFT JOIN memory_embeddings
+                    ON memory_embeddings.chunk_id = memory_chunks.id
+                    AND memory_embeddings.model = ?
+                WHERE memory_embeddings.chunk_id IS NULL
+                    OR memory_embeddings.source_text_hash IS NULL
+                """,
+                (LOCAL_VECTOR_MODEL,),
+            ).fetchall()
+            for row in rows:
+                self._upsert_embedding(conn, str(row["id"]), str(row["safe_text"] or row["text"]), now)
+        return len(rows)
 
     def get_item(self, memory_id: str) -> MemoryItem | None:
         with self._connect() as conn:
@@ -203,19 +204,30 @@ class PersistentMemoryStore:
 
     def delete_item(self, memory_id: str) -> bool:
         with self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM memory_embeddings
+                WHERE chunk_id IN (SELECT id FROM memory_chunks WHERE memory_id = ?)
+                """,
+                (memory_id,),
+            )
             conn.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (memory_id,))
             cursor = conn.execute("DELETE FROM memory_items WHERE id = ?", (memory_id,))
         return cursor.rowcount > 0
 
     def search(self, query: str, limit: int = 6) -> list[MemorySearchResult]:
         query_tokens = _tokens(query)
-        if not query_tokens:
+        query_vector = embed_text(query)
+        if not query_tokens and not any(query_vector):
             return []
+
+        self.backfill_missing_embeddings()
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT
                     memory_chunks.*,
+                    memory_embeddings.vector_json,
                     memory_items.title,
                     memory_items.transcript,
                     memory_items.safe_content,
@@ -229,37 +241,25 @@ class PersistentMemoryStore:
                     memory_items.updated_at
                 FROM memory_chunks
                 JOIN memory_items ON memory_items.id = memory_chunks.memory_id
+                LEFT JOIN memory_embeddings
+                    ON memory_embeddings.chunk_id = memory_chunks.id
+                    AND memory_embeddings.model = ?
                 ORDER BY memory_items.created_at DESC, memory_chunks.chunk_index ASC
-                """
+                """,
+                (LOCAL_VECTOR_MODEL,),
             ).fetchall()
 
         scored: list[MemorySearchResult] = []
         for row in rows:
-            haystack = " ".join([str(row["title"]), str(row["text"]), str(row["safe_text"])])
             tasks = list(json.loads(str(row["tasks_json"])))
             decisions = list(json.loads(str(row["decisions_json"])))
             risks = list(json.loads(str(row["risks_json"])))
-            artifact_terms: list[str] = []
-            if tasks:
-                artifact_terms.extend(["tarea", "tareas", "accion", "acciones", "pendiente", "responsable"])
-            if decisions:
-                artifact_terms.extend(["decision", "decisiones", "acuerdo", "acuerdos", "aprobado"])
-            if risks:
-                artifact_terms.extend(["riesgo", "riesgos", "bloqueo", "incidente", "critico", "critico"])
-            haystack = " ".join(
-                [
-                    haystack,
-                    str(row["summary"]),
-                    " ".join(tasks),
-                    " ".join(decisions),
-                    " ".join(risks),
-                    " ".join(artifact_terms),
-                ]
-            )
-            haystack_tokens = _tokens(haystack)
-            overlap = query_tokens & haystack_tokens
-            phrase_bonus = 2.0 if query.lower() in haystack.lower() else 0.0
-            score = len(overlap) + phrase_bonus
+            haystack = _search_haystack(row, tasks=tasks, decisions=decisions, risks=risks)
+            lexical_score = _lexical_score(query, query_tokens, haystack)
+            vector_score = cosine_similarity(query_vector, vector_from_json(str(row["vector_json"] or "[]")))
+            score = (0.45 * lexical_score) + (0.55 * max(vector_score, 0.0))
+            if lexical_score <= 0 and vector_score < VECTOR_MATCH_THRESHOLD:
+                continue
             if score <= 0:
                 continue
             item = MemoryItem(
@@ -284,14 +284,42 @@ class PersistentMemoryStore:
                 safe_text=str(row["safe_text"]),
                 created_at=str(row["created_at"]),
             )
-            scored.append(MemorySearchResult(item=item, chunk=chunk, score=score))
+            scored.append(MemorySearchResult(item=item, chunk=chunk, score=round(score, 4)))
         return sorted(scored, key=lambda result: result.score, reverse=True)[:limit]
 
     def counts(self) -> dict[str, int]:
+        self.backfill_missing_embeddings()
         with self._connect() as conn:
             item_count = conn.execute("SELECT COUNT(*) AS count FROM memory_items").fetchone()["count"]
             chunk_count = conn.execute("SELECT COUNT(*) AS count FROM memory_chunks").fetchone()["count"]
-        return {"items": int(item_count), "chunks": int(chunk_count)}
+            embedding_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM memory_embeddings WHERE model = ?",
+                (LOCAL_VECTOR_MODEL,),
+            ).fetchone()["count"]
+        return {
+            "items": int(item_count),
+            "chunks": int(chunk_count),
+            "embeddings": int(embedding_count),
+            "vector_dimensions": LOCAL_VECTOR_DIMENSIONS,
+        }
+
+    def _upsert_embedding(self, conn, chunk_id: str, text: str, created_at: str) -> None:
+        source_hash = _hash_text(text)
+        vector = embed_text(text)
+        conn.execute(
+            """
+            INSERT INTO memory_embeddings (
+                chunk_id, model, vector_json, dimensions, source_text_hash, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_id, model) DO UPDATE SET
+                vector_json = excluded.vector_json,
+                dimensions = excluded.dimensions,
+                source_text_hash = excluded.source_text_hash,
+                created_at = excluded.created_at
+            """,
+            (chunk_id, LOCAL_VECTOR_MODEL, vector_to_json(vector), LOCAL_VECTOR_DIMENSIONS, source_hash, created_at),
+        )
 
     @staticmethod
     def _item_from_row(row: sqlite3.Row) -> MemoryItem:
@@ -311,6 +339,38 @@ class PersistentMemoryStore:
         )
 
 
+def _search_haystack(row, *, tasks: list[str], decisions: list[str], risks: list[str]) -> str:
+    artifact_terms: list[str] = []
+    if tasks:
+        artifact_terms.extend(["tarea", "tareas", "accion", "acciones", "pendiente", "responsable"])
+    if decisions:
+        artifact_terms.extend(["decision", "decisiones", "acuerdo", "acuerdos", "aprobado"])
+    if risks:
+        artifact_terms.extend(["riesgo", "riesgos", "bloqueo", "incidente", "critico", "crítico"])
+    return " ".join(
+        [
+            str(row["title"]),
+            str(row["text"]),
+            str(row["safe_text"]),
+            str(row["summary"]),
+            " ".join(tasks),
+            " ".join(decisions),
+            " ".join(risks),
+            " ".join(artifact_terms),
+        ]
+    )
+
+
+def _lexical_score(query: str, query_tokens: set[str], haystack: str) -> float:
+    haystack_tokens = _tokens(haystack)
+    if not query_tokens:
+        return 0.0
+    overlap = query_tokens & haystack_tokens
+    base = len(overlap) / max(len(query_tokens), 1)
+    phrase_bonus = 0.2 if _normalize(query).lower() in _normalize(haystack).lower() else 0.0
+    return min(base + phrase_bonus, 1.0)
+
+
 def _tokens(text: str) -> set[str]:
     tokens: set[str] = set()
     for raw_token in TOKEN_PATTERN.findall(_normalize(text)):
@@ -325,3 +385,7 @@ def _tokens(text: str) -> set[str]:
 def _normalize(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text)
     return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

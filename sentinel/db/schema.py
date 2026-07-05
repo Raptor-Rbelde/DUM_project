@@ -51,8 +51,11 @@ def initialize_database(db_path: str | Path) -> None:
             )
             """
         )
-        _apply_migration(conn, 1, "core_enterprise_memory_schema", _create_core_schema)
+        _apply_migration(conn, 1, "core_vector_memory_schema", _create_core_schema)
         _ensure_memory_columns(conn)
+        _ensure_enterprise_memory_tables(conn)
+        _ensure_embedding_columns(conn)
+        _ensure_indexes(conn)
 
 
 def database_status(db_path: str | Path) -> dict[str, Any]:
@@ -75,7 +78,7 @@ def database_status(db_path: str | Path) -> dict[str, Any]:
             if table in tables:
                 counts[table] = int(conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()["count"])
     return {
-        "engine": "sqlite",
+        "engine": "sqlite-vector",
         "schema_version": int(current_version["version"] if current_version else 0),
         "tables": tables,
         "counts": counts,
@@ -111,9 +114,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             payload_fingerprint TEXT,
             metadata_json TEXT NOT NULL DEFAULT '{}'
         );
-        CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp ON audit_events(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_audit_events_session_id ON audit_events(session_id);
-        CREATE INDEX IF NOT EXISTS idx_audit_events_type ON audit_events(event_type);
 
         CREATE TABLE IF NOT EXISTS entity_vault (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,8 +124,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(session_id, entity_type, original_value)
         );
-        CREATE INDEX IF NOT EXISTS idx_entity_vault_session_id ON entity_vault(session_id);
-        CREATE INDEX IF NOT EXISTS idx_entity_vault_type ON entity_vault(entity_type);
 
         CREATE TABLE IF NOT EXISTS meetings (
             id TEXT PRIMARY KEY,
@@ -134,7 +132,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_meetings_created_at ON meetings(created_at);
 
         CREATE TABLE IF NOT EXISTS privacy_reports (
             meeting_id TEXT PRIMARY KEY,
@@ -153,7 +150,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_meeting_tasks_meeting_id ON meeting_tasks(meeting_id);
 
         CREATE TABLE IF NOT EXISTS meeting_decisions (
             id TEXT PRIMARY KEY,
@@ -162,7 +158,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_meeting_decisions_meeting_id ON meeting_decisions(meeting_id);
 
         CREATE TABLE IF NOT EXISTS meeting_summaries (
             meeting_id TEXT PRIMARY KEY,
@@ -189,9 +184,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_memory_items_created_at ON memory_items(created_at);
-        CREATE INDEX IF NOT EXISTS idx_memory_items_source ON memory_items(source);
-        CREATE INDEX IF NOT EXISTS idx_memory_items_retention_state ON memory_items(retention_state);
 
         CREATE TABLE IF NOT EXISTS memory_chunks (
             id TEXT PRIMARY KEY,
@@ -207,8 +199,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE CASCADE,
             UNIQUE(memory_id, chunk_index)
         );
-        CREATE INDEX IF NOT EXISTS idx_memory_chunks_memory_id ON memory_chunks(memory_id);
-        CREATE INDEX IF NOT EXISTS idx_memory_chunks_index ON memory_chunks(memory_id, chunk_index);
 
         CREATE TABLE IF NOT EXISTS memory_entities (
             id TEXT PRIMARY KEY,
@@ -225,9 +215,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE CASCADE,
             UNIQUE(memory_id, entity_type, original_hash, start_char, end_char)
         );
-        CREATE INDEX IF NOT EXISTS idx_memory_entities_memory_id ON memory_entities(memory_id);
-        CREATE INDEX IF NOT EXISTS idx_memory_entities_type ON memory_entities(entity_type);
-        CREATE INDEX IF NOT EXISTS idx_memory_entities_placeholder ON memory_entities(placeholder);
 
         CREATE TABLE IF NOT EXISTS memory_artifacts (
             id TEXT PRIMARY KEY,
@@ -243,9 +230,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE CASCADE,
             UNIQUE(memory_id, artifact_type, content_hash)
         );
-        CREATE INDEX IF NOT EXISTS idx_memory_artifacts_memory_id ON memory_artifacts(memory_id);
-        CREATE INDEX IF NOT EXISTS idx_memory_artifacts_type ON memory_artifacts(artifact_type);
-        CREATE INDEX IF NOT EXISTS idx_memory_artifacts_status ON memory_artifacts(status);
 
         CREATE TABLE IF NOT EXISTS memory_questions (
             id TEXT PRIMARY KEY,
@@ -257,8 +241,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             external_sent INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_memory_questions_created_at ON memory_questions(created_at);
-        CREATE INDEX IF NOT EXISTS idx_memory_questions_mode ON memory_questions(mode);
 
         CREATE TABLE IF NOT EXISTS memory_question_sources (
             question_id TEXT NOT NULL,
@@ -271,8 +253,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE CASCADE,
             FOREIGN KEY(chunk_id) REFERENCES memory_chunks(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_memory_question_sources_memory_id ON memory_question_sources(memory_id);
-        CREATE INDEX IF NOT EXISTS idx_memory_question_sources_chunk_id ON memory_question_sources(chunk_id);
 
         CREATE TABLE IF NOT EXISTS memory_tags (
             memory_id TEXT NOT NULL,
@@ -281,7 +261,6 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(memory_id, tag),
             FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
 
         CREATE TABLE IF NOT EXISTS memory_links (
             id TEXT PRIMARY KEY,
@@ -293,15 +272,13 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(source_memory_id) REFERENCES memory_items(id) ON DELETE CASCADE,
             FOREIGN KEY(target_memory_id) REFERENCES memory_items(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_memory_links_source ON memory_links(source_memory_id);
-        CREATE INDEX IF NOT EXISTS idx_memory_links_target ON memory_links(target_memory_id);
-        CREATE INDEX IF NOT EXISTS idx_memory_links_relation ON memory_links(relation_type);
 
         CREATE TABLE IF NOT EXISTS memory_embeddings (
             chunk_id TEXT NOT NULL,
             model TEXT NOT NULL,
             vector_json TEXT NOT NULL,
             dimensions INTEGER NOT NULL,
+            source_text_hash TEXT,
             created_at TEXT NOT NULL,
             PRIMARY KEY(chunk_id, model),
             FOREIGN KEY(chunk_id) REFERENCES memory_chunks(id) ON DELETE CASCADE
@@ -311,7 +288,7 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_memory_columns(conn: sqlite3.Connection) -> None:
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)").fetchall()}
+    item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)").fetchall()}
     item_migrations = {
         "summary": "ALTER TABLE memory_items ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
         "tasks_json": "ALTER TABLE memory_items ADD COLUMN tasks_json TEXT NOT NULL DEFAULT '[]'",
@@ -323,7 +300,7 @@ def _ensure_memory_columns(conn: sqlite3.Connection) -> None:
         "deleted_at": "ALTER TABLE memory_items ADD COLUMN deleted_at TEXT",
     }
     for column, statement in item_migrations.items():
-        if column not in columns:
+        if column not in item_columns:
             conn.execute(statement)
 
     chunk_columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_chunks)").fetchall()}
@@ -336,3 +313,141 @@ def _ensure_memory_columns(conn: sqlite3.Connection) -> None:
     for column, statement in chunk_migrations.items():
         if column not in chunk_columns:
             conn.execute(statement)
+
+
+def _ensure_embedding_columns(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_embeddings (
+            chunk_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            vector_json TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            source_text_hash TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(chunk_id, model),
+            FOREIGN KEY(chunk_id) REFERENCES memory_chunks(id) ON DELETE CASCADE
+        )
+        """
+    )
+    embedding_columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_embeddings)").fetchall()}
+    embedding_migrations = {
+        "source_text_hash": "ALTER TABLE memory_embeddings ADD COLUMN source_text_hash TEXT",
+    }
+    for column, statement in embedding_migrations.items():
+        if column not in embedding_columns:
+            conn.execute(statement)
+
+
+def _ensure_enterprise_memory_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS memory_entities (
+            id TEXT PRIMARY KEY,
+            memory_id TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            action TEXT NOT NULL,
+            sensitivity TEXT NOT NULL,
+            placeholder TEXT,
+            confidence REAL NOT NULL,
+            start_char INTEGER NOT NULL,
+            end_char INTEGER NOT NULL,
+            original_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE CASCADE,
+            UNIQUE(memory_id, entity_type, original_hash, start_char, end_char)
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_artifacts (
+            id TEXT PRIMARY KEY,
+            memory_id TEXT NOT NULL,
+            artifact_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            owner TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            source TEXT NOT NULL DEFAULT 'local_extractor',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE CASCADE,
+            UNIQUE(memory_id, artifact_type, content_hash)
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_questions (
+            id TEXT PRIMARY KEY,
+            question TEXT NOT NULL,
+            safe_question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            source_count INTEGER NOT NULL,
+            external_sent INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_question_sources (
+            question_id TEXT NOT NULL,
+            memory_id TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            score REAL NOT NULL,
+            PRIMARY KEY(question_id, rank),
+            FOREIGN KEY(question_id) REFERENCES memory_questions(id) ON DELETE CASCADE,
+            FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE CASCADE,
+            FOREIGN KEY(chunk_id) REFERENCES memory_chunks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_tags (
+            memory_id TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(memory_id, tag),
+            FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_links (
+            id TEXT PRIMARY KEY,
+            source_memory_id TEXT NOT NULL,
+            target_memory_id TEXT NOT NULL,
+            relation_type TEXT NOT NULL,
+            evidence TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(source_memory_id) REFERENCES memory_items(id) ON DELETE CASCADE,
+            FOREIGN KEY(target_memory_id) REFERENCES memory_items(id) ON DELETE CASCADE
+        );
+        """
+    )
+
+
+def _ensure_indexes(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp ON audit_events(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_audit_events_session_id ON audit_events(session_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_events_type ON audit_events(event_type);
+        CREATE INDEX IF NOT EXISTS idx_entity_vault_session_id ON entity_vault(session_id);
+        CREATE INDEX IF NOT EXISTS idx_entity_vault_type ON entity_vault(entity_type);
+        CREATE INDEX IF NOT EXISTS idx_meetings_created_at ON meetings(created_at);
+        CREATE INDEX IF NOT EXISTS idx_meeting_tasks_meeting_id ON meeting_tasks(meeting_id);
+        CREATE INDEX IF NOT EXISTS idx_meeting_decisions_meeting_id ON meeting_decisions(meeting_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_items_created_at ON memory_items(created_at);
+        CREATE INDEX IF NOT EXISTS idx_memory_items_source ON memory_items(source);
+        CREATE INDEX IF NOT EXISTS idx_memory_items_retention_state ON memory_items(retention_state);
+        CREATE INDEX IF NOT EXISTS idx_memory_chunks_memory_id ON memory_chunks(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_chunks_index ON memory_chunks(memory_id, chunk_index);
+        CREATE INDEX IF NOT EXISTS idx_memory_entities_memory_id ON memory_entities(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_entities_type ON memory_entities(entity_type);
+        CREATE INDEX IF NOT EXISTS idx_memory_entities_placeholder ON memory_entities(placeholder);
+        CREATE INDEX IF NOT EXISTS idx_memory_artifacts_memory_id ON memory_artifacts(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_artifacts_type ON memory_artifacts(artifact_type);
+        CREATE INDEX IF NOT EXISTS idx_memory_artifacts_status ON memory_artifacts(status);
+        CREATE INDEX IF NOT EXISTS idx_memory_questions_created_at ON memory_questions(created_at);
+        CREATE INDEX IF NOT EXISTS idx_memory_questions_mode ON memory_questions(mode);
+        CREATE INDEX IF NOT EXISTS idx_memory_question_sources_memory_id ON memory_question_sources(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_question_sources_chunk_id ON memory_question_sources(chunk_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
+        CREATE INDEX IF NOT EXISTS idx_memory_links_source ON memory_links(source_memory_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_links_target ON memory_links(target_memory_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_links_relation ON memory_links(relation_type);
+        CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model ON memory_embeddings(model);
+        """
+    )

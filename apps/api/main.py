@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from sentinel.audit.store import AuditStore
 from sentinel.config.settings import Settings, load_settings
+from sentinel.db.schema import database_status
 from sentinel.domain.privacy import SystemMode
 from sentinel.memory.service import MemoryService
 from sentinel.memory.store import PersistentMemoryStore
@@ -102,6 +103,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "db_path": str(Path(app_settings.db_path)),
             "memory": memory_service.counts(),
         }
+
+    @app.get("/api/database/status")
+    def get_database_status() -> dict[str, object]:
+        return database_status(app_settings.db_path)
 
     @app.post("/api/privacy/analyze")
     def analyze_privacy(request: AnalyzePrivacyRequest):

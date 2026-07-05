@@ -9,7 +9,8 @@ Sentinel is a modular monolith designed to run locally on an NVIDIA Jetson Orin 
 - `sentinel.audit`: local audit event store with payload fingerprints, never raw secrets.
 - `sentinel.meetings`: meeting persistence and analysis orchestration.
 - `sentinel.tasks`: local heuristic summary, task, and decision extraction.
-- `sentinel.memory`: memory store abstraction for later local knowledge work.
+- `sentinel.db`: versioned SQLite schema for local persistence and vector tables.
+- `sentinel.memory`: enterprise memory, local embeddings, hybrid vector retrieval, and question answering.
 - `sentinel.providers`: provider interfaces, OpenAI adapter, and Cloud Gateway.
 - `apps.api`: FastAPI composition root.
 - `apps.web`: touchscreen-friendly React UI.
@@ -39,14 +40,6 @@ The current MVP uses deterministic local detectors with explicit priority rules.
 
 ## Persistence
 
-SQLite stores:
+SQLite stores entity vault mappings, audit events, meetings, privacy reports, summaries, tasks, decisions, enterprise memory chunks, and local vector embeddings.
 
-- entity vault mappings;
-- audit events;
-- meetings;
-- privacy reports;
-- summaries;
-- tasks;
-- decisions.
-
-The MVP uses one database at `data/local/sentinel.sqlite` by default. This keeps the buildathon workflow simple and still preserves clear module boundaries for later service extraction.
+The MVP uses one database at `data/local/sentinel.sqlite` by default. The memory layer is vectorial through `memory_embeddings` and hybrid search. See `docs/vector-database.md`.
