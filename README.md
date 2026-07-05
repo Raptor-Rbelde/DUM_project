@@ -79,6 +79,8 @@ The recommended buildathon deploy is one Docker web service with a persistent `/
 
 See [docs/deployment.md](docs/deployment.md).
 
+Vercel container deployment is also documented for preview/demo usage, but it does not provide the same persistent local disk behavior for SQLite memory. See [docs/vercel-deployment.md](docs/vercel-deployment.md).
+
 ## API Highlights
 
 - `GET /health`
