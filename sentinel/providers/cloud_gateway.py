@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel
 
 from sentinel.audit.store import AuditStore
@@ -31,6 +33,13 @@ class SafePayloadValidator:
     def validate(self, payload: str, *, purpose: str) -> SafePayloadValidation:
         if not purpose.strip():
             return SafePayloadValidation(allowed=False, reason="External requests require an explicit purpose.")
+        unsafe_intent = self._unsafe_instruction_intent(purpose)
+        if unsafe_intent is not None:
+            return SafePayloadValidation(
+                allowed=False,
+                reason=unsafe_intent,
+                restricted_types=["PROMPT_INJECTION"],
+            )
         purpose_entities = [self.policy.apply(entity) for entity in self.detector.detect(purpose)]
         unsafe_purpose_entities = [
             entity
@@ -54,6 +63,17 @@ class SafePayloadValidator:
         return SafePayloadValidation(allowed=True, reason="Payload passed local privacy validation.")
 
     @staticmethod
+    def _unsafe_instruction_intent(purpose: str) -> str | None:
+        normalized = _normalize_security_text(purpose)
+        if _PROMPT_INJECTION_PATTERN.search(normalized):
+            return "Solicitud bloqueada: intento de prompt injection o de anular instrucciones de seguridad."
+        if _SENSITIVE_EXFILTRATION_PATTERN.search(normalized):
+            return "Solicitud bloqueada: no puedo revelar datos sensibles, secretos ni valores ocultos."
+        if _BROAD_DATA_EXPORT_PATTERN.search(normalized) and _SENSITIVE_DATA_TARGET_PATTERN.search(normalized):
+            return "Solicitud bloqueada: no se permite exportar datos sensibles de forma masiva."
+        return None
+
+    @staticmethod
     def _restricted_types() -> set[SensitiveEntityType]:
         return {
             SensitiveEntityType.API_KEY,
@@ -63,6 +83,52 @@ class SafePayloadValidator:
             SensitiveEntityType.ID_DOCUMENT,
             SensitiveEntityType.OTHER_SECRET,
         }
+
+
+def _normalize_security_text(value: str) -> str:
+    replacements = {
+        "á": "a",
+        "é": "e",
+        "í": "i",
+        "ó": "o",
+        "ú": "u",
+        "ü": "u",
+        "ñ": "n",
+    }
+    normalized = value.lower()
+    for source, target in replacements.items():
+        normalized = normalized.replace(source, target)
+    return normalized
+
+
+_PROMPT_INJECTION_PATTERN = re.compile(
+    r"\b("
+    r"ignora|ignorar|olvida|olvidar|omite|omitir|saltate|saltar|bypassea|bypass|desactiva|desactivar|"
+    r"override|jailbreak|prompt injection|system prompt|developer message|modo desarrollador|"
+    r"instrucciones anteriores|instrucciones del sistema|politicas de seguridad|reglas de seguridad|"
+    r"no obedezcas|sin restricciones|sin filtros"
+    r")\b"
+)
+
+_SENSITIVE_EXFILTRATION_PATTERN = re.compile(
+    r"\b("
+    r"revela|revelar|muestra|mostrar|dame|entrega|entregar|extrae|extraer|exporta|exportar|"
+    r"imprime|imprimir|lista|listar|devuelve|devolver|reconstruye|reconstruir|desenmascara|desenmascarar"
+    r")\b.{0,120}\b("
+    r"secreto|secretos|api key|api keys|apikey|token|tokens|password|passwords|contrasena|contrasenas|"
+    r"private key|llave privada|credenciales|variables de entorno|\.env|jwt|jwt_secret|datos sensibles|"
+    r"data sensible|informacion sensible|payload original|texto original|transcripcion original|"
+    r"placeholders|marcadores|valores ocultos|hidden values|vault"
+    r")\b"
+)
+
+_BROAD_DATA_EXPORT_PATTERN = re.compile(
+    r"\b(todo|todos|toda|todas|completo|completa|full|all|dump|volcado|masivo|masiva)\b"
+)
+
+_SENSITIVE_DATA_TARGET_PATTERN = re.compile(
+    r"\b(data|datos|informacion|contenido|payload|memoria|secretos|credenciales|sensibles|sensible)\b"
+)
 
 
 class CloudGateway:

@@ -52,6 +52,9 @@ class Settings:
     openai_model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
     elevenlabs_api_key: str | None = field(default_factory=lambda: os.getenv("ELEVENLABS_API_KEY") or None)
     elevenlabs_stt_model: str = field(default_factory=lambda: os.getenv("ELEVENLABS_STT_MODEL", "scribe_v2"))
+    elevenlabs_tts_voice_id: str = field(default_factory=lambda: os.getenv("ELEVENLABS_TTS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb"))
+    elevenlabs_tts_model: str = field(default_factory=lambda: os.getenv("ELEVENLABS_TTS_MODEL", "eleven_multilingual_v2"))
+    elevenlabs_tts_output_format: str = field(default_factory=lambda: os.getenv("ELEVENLABS_TTS_OUTPUT_FORMAT", "mp3_44100_128"))
     elevenlabs_enable_logging: bool = field(default_factory=lambda: _env_bool("ELEVENLABS_ENABLE_LOGGING", True))
     elevenlabs_timeout_seconds: int = field(default_factory=lambda: int(os.getenv("ELEVENLABS_TIMEOUT_SECONDS", "90")))
     cors_origins: list[str] = field(

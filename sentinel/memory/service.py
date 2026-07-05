@@ -185,8 +185,21 @@ class MemoryService:
             self.audit_store.record("memory_item_deleted", session_id=memory_id)
         return deleted
 
-    def search(self, query: str, limit: int = 6) -> list[MemorySource]:
-        return [self._source_from_result(result) for result in self.memory_store.search(query, limit=limit)]
+    def search(
+        self,
+        query: str,
+        limit: int = 6,
+        exclude_memory_ids: list[str] | None = None,
+    ) -> list[MemorySource]:
+        search_query = _searchable_memory_question(query)
+        return [
+            self._source_from_result(result)
+            for result in self.memory_store.search(
+                search_query,
+                limit=limit,
+                exclude_memory_ids=exclude_memory_ids,
+            )
+        ]
 
     def ask(
         self,
@@ -195,8 +208,10 @@ class MemoryService:
         mode: SystemMode,
         limit: int = 6,
         cloud_gateway: CloudGateway | None = None,
+        exclude_memory_ids: list[str] | None = None,
     ) -> MemoryAnswer:
-        results = self.memory_store.search(question, limit=limit)
+        search_question = _searchable_memory_question(question)
+        results = self.memory_store.search(search_question, limit=limit, exclude_memory_ids=exclude_memory_ids)
         sources = [self._source_from_result(result) for result in results]
         safe_question = self._sanitize_question_for_results(question, results)
         safe_context = self._safe_context(results, safe_question=safe_question)
@@ -670,3 +685,18 @@ def _contains_term(normalized_text: str, term: str) -> bool:
     if len(normalized_term) <= 3 and normalized_term.isalpha():
         return bool(re.search(rf"\b{re.escape(normalized_term)}\b", normalized_text))
     return normalized_term in normalized_text
+
+
+def _searchable_memory_question(question: str) -> str:
+    cleaned = re.sub(
+        r"\b("
+        r"memoria|historial|grabaciones|grabacion|conversacion(?:es)?|reunion(?:es)?|sesion(?:es)?|"
+        r"pasada(?:s)?|pasado(?:s)?|anterior(?:es)?|previa(?:s)?|previo(?:s)?|vieja(?:s)?|viejo(?:s)?|"
+        r"ultima(?:s)?|ultimo(?:s)?|actual(?:es)?|reciente(?:s)?|empresa(?:rial)?"
+        r")\b",
+        " ",
+        question,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or question

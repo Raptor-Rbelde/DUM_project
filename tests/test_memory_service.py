@@ -50,6 +50,32 @@ def test_memory_remembers_transcript_and_returns_local_reconstructed_sources(tmp
     assert "Carlos Hernandez" not in sources[0].safe_snippet
 
 
+def test_memory_question_can_exclude_current_transcript(tmp_path) -> None:
+    service, _, _ = make_memory_service(tmp_path)
+
+    previous = service.remember_transcript(
+        title="Reunion anterior de tesoreria",
+        transcript=(
+            "Valeria ordeno deshabilitar las transferencias internacionales y revocar la llave de Stripe. "
+            "No se debe congelar la cuenta corporativa principal."
+        ),
+    )
+    current = service.remember_transcript(
+        title="Reunion actual de recursos humanos",
+        transcript="Andrea pidio actualizar el onboarding y revisar el calendario de vacaciones del equipo.",
+    )
+
+    answer = service.ask(
+        question="Que se decidio en la conversacion pasada sobre transferencias?",
+        mode=SystemMode.VAULT,
+        exclude_memory_ids=[current.memory_id],
+    )
+
+    assert answer.sources
+    assert answer.sources[0].memory_id == previous.memory_id
+    assert all(source.memory_id != current.memory_id for source in answer.sources)
+
+
 def test_memory_intelligence_sends_only_safe_context_to_provider(tmp_path) -> None:
     service, _, audit_store = make_memory_service(tmp_path)
     provider = SpyProvider()

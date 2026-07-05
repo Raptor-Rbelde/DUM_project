@@ -28,6 +28,8 @@ PREFIX_BY_TYPE = {
     SensitiveEntityType.CONNECTION_STRING: "CONN",
 }
 
+NON_RECONSTRUCTABLE_PREFIXES = ("SECRET_", "CONN_")
+
 
 class EntityVault:
     def __init__(self, db_path: str | Path) -> None:
@@ -132,6 +134,8 @@ class EntityVault:
         for row in rows:
             placeholder = str(row["placeholder"])
             if allowed_placeholders is not None and placeholder not in allowed_placeholders:
+                continue
+            if allowed_placeholders is None and placeholder.startswith(NON_RECONSTRUCTABLE_PREFIXES):
                 continue
             reconstructed = reconstructed.replace(f"[{placeholder}]", str(row["original_value"]))
         return reconstructed

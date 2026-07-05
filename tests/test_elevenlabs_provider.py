@@ -10,6 +10,8 @@ from sentinel.providers.elevenlabs_provider import ElevenLabsSpeechToTextProvide
 
 
 class FakeResponse:
+    headers = {"content-type": "application/json"}
+
     def __enter__(self) -> "FakeResponse":
         return self
 
@@ -25,6 +27,19 @@ class FakeResponse:
                 "words": [{"text": "Hola", "speaker_id": "speaker_1", "start": 0, "end": 0.2}],
             }
         ).encode("utf-8")
+
+
+class FakeAudioResponse:
+    headers = {"content-type": "audio/mpeg"}
+
+    def __enter__(self) -> "FakeAudioResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return b"mp3-bytes"
 
 
 def test_elevenlabs_provider_posts_audio_as_multipart(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -64,11 +79,47 @@ def test_elevenlabs_provider_posts_audio_as_multipart(monkeypatch: pytest.Monkey
     assert result.language_probability == 0.99
 
 
+def test_elevenlabs_provider_synthesizes_speech(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request: Any, timeout: int) -> FakeAudioResponse:
+        captured["url"] = request.full_url
+        captured["headers"] = dict(request.header_items())
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return FakeAudioResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    provider = ElevenLabsSpeechToTextProvider(api_key="test-key", timeout_seconds=9)
+
+    result = provider.synthesize_speech(
+        "Hola desde TEO",
+        voice_id="voice-123",
+        model_id="eleven_multilingual_v2",
+        output_format="mp3_44100_128",
+    )
+
+    assert captured["url"].startswith("https://api.elevenlabs.io/v1/text-to-speech/voice-123?")
+    assert "output_format=mp3_44100_128" in captured["url"]
+    assert captured["headers"]["Xi-api-key"] == "test-key"
+    assert captured["headers"]["Content-type"] == "application/json"
+    assert captured["headers"]["Accept"] == "audio/mpeg"
+    assert captured["body"]["text"] == "Hola desde TEO"
+    assert captured["body"]["model_id"] == "eleven_multilingual_v2"
+    assert captured["timeout"] == 9
+    assert result.audio == b"mp3-bytes"
+    assert result.content_type == "audio/mpeg"
+    assert result.voice_id == "voice-123"
+
+
 def test_elevenlabs_provider_requires_api_key() -> None:
     provider = ElevenLabsSpeechToTextProvider(api_key=None)
 
     with pytest.raises(RuntimeError, match="ELEVENLABS_API_KEY"):
         provider.transcribe_bytes(b"audio")
+
+    with pytest.raises(RuntimeError, match="ELEVENLABS_API_KEY"):
+        provider.synthesize_speech("Hola", voice_id="voice-123")
 
 
 def test_elevenlabs_provider_explains_zero_retention_rejection(monkeypatch: pytest.MonkeyPatch) -> None:

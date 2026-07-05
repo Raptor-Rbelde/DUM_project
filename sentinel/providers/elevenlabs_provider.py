@@ -21,9 +21,19 @@ class TranscriptionResult:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SpeechSynthesisResult:
+    provider: str
+    model_id: str
+    voice_id: str
+    content_type: str
+    audio: bytes
+
+
 class ElevenLabsSpeechToTextProvider:
     name = "elevenlabs"
-    endpoint = "https://api.elevenlabs.io/v1/speech-to-text"
+    stt_endpoint = "https://api.elevenlabs.io/v1/speech-to-text"
+    tts_endpoint = "https://api.elevenlabs.io/v1/text-to-speech"
 
     def __init__(
         self,
@@ -72,7 +82,7 @@ class ElevenLabsSpeechToTextProvider:
             content_type=content_type or _guess_content_type(filename),
             file_bytes=audio,
         )
-        url = f"{self.endpoint}?{urllib.parse.urlencode({'enable_logging': _bool_form(self.enable_logging)})}"
+        url = f"{self.stt_endpoint}?{urllib.parse.urlencode({'enable_logging': _bool_form(self.enable_logging)})}"
         request = urllib.request.Request(
             url,
             data=body,
@@ -104,6 +114,73 @@ class ElevenLabsSpeechToTextProvider:
             language_probability=_optional_float(payload.get("language_probability")),
             words=list(payload.get("words") or []),
             raw=payload,
+        )
+
+    def synthesize_speech(
+        self,
+        text: str,
+        *,
+        voice_id: str,
+        model_id: str = "eleven_multilingual_v2",
+        output_format: str = "mp3_44100_128",
+        language_code: str | None = "es",
+    ) -> SpeechSynthesisResult:
+        if not self.api_key:
+            raise RuntimeError("ELEVENLABS_API_KEY is not configured")
+        spoken_text = text.strip()
+        if not spoken_text:
+            raise ValueError("Text payload is empty")
+
+        query = urllib.parse.urlencode(
+            {
+                "enable_logging": _bool_form(self.enable_logging),
+                "output_format": output_format,
+            }
+        )
+        url = f"{self.tts_endpoint}/{urllib.parse.quote(voice_id)}?{query}"
+        payload: dict[str, Any] = {
+            "text": spoken_text,
+            "model_id": model_id,
+            "voice_settings": {
+                "stability": 0.55,
+                "similarity_boost": 0.75,
+                "style": 0.25,
+                "use_speaker_boost": True,
+            },
+        }
+        if language_code and model_id != "eleven_multilingual_v2":
+            payload["language_code"] = language_code
+
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "xi-api-key": self.api_key,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                audio = response.read()
+                content_type = response.headers.get("content-type", "audio/mpeg")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if _is_zero_retention_forbidden(detail):
+                raise RuntimeError(
+                    "ElevenLabs rejected zero retention mode. Set ELEVENLABS_ENABLE_LOGGING=true, "
+                    "or use an ElevenLabs account that supports zero retention."
+                ) from exc
+            raise RuntimeError(f"ElevenLabs speech synthesis failed: {exc.code} {detail}") from exc
+
+        return SpeechSynthesisResult(
+            provider=self.name,
+            model_id=model_id,
+            voice_id=voice_id,
+            content_type=content_type,
+            audio=audio,
         )
 
 

@@ -229,11 +229,12 @@ class PersistentMemoryStore:
             cursor = conn.execute("DELETE FROM memory_items WHERE id = ?", (memory_id,))
         return cursor.rowcount > 0
 
-    def search(self, query: str, limit: int = 6) -> list[MemorySearchResult]:
+    def search(self, query: str, limit: int = 6, exclude_memory_ids: list[str] | None = None) -> list[MemorySearchResult]:
         query_tokens = _tokens(query)
         query_vector = embed_text(query)
         if not query_tokens and not any(query_vector):
             return []
+        excluded = set(exclude_memory_ids or [])
 
         self.backfill_missing_embeddings()
         with self._connect() as conn:
@@ -267,6 +268,8 @@ class PersistentMemoryStore:
 
         scored: list[MemorySearchResult] = []
         for row in rows:
+            if str(row["memory_id"]) in excluded:
+                continue
             tasks = list(json.loads(str(row["tasks_json"])))
             decisions = list(json.loads(str(row["decisions_json"])))
             risks = list(json.loads(str(row["risks_json"])))

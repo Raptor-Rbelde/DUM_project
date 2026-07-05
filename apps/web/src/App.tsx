@@ -110,6 +110,10 @@ type MemoryAnswer = {
   safe_context: string;
 };
 
+type AskMemoryOptions = {
+  excludeCurrent?: boolean;
+};
+
 type TranscriptionResponse = {
   provider: string;
   model_id: string;
@@ -157,6 +161,7 @@ declare global {
   interface Window {
     SpeechRecognition?: SpeechRecognitionConstructor;
     webkitSpeechRecognition?: SpeechRecognitionConstructor;
+    webkitAudioContext?: typeof AudioContext;
   }
 }
 
@@ -234,7 +239,13 @@ function App() {
   const voiceControlPhrasesRef = useRef<string[]>([]);
   const rememberedTranscriptRef = useRef<string | null>(null);
   const isSpeakingRef = useRef(false);
-  const pendingSpeechRef = useRef<string | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioOutputUnlockedRef = useRef(false);
+  const pendingSpeechTextRef = useRef<string | null>(null);
+  const speechSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const speechAbortControllerRef = useRef<AbortController | null>(null);
+  const speechRequestSeqRef = useRef(0);
+  const recordingCanceledRef = useRef(false);
   const isRecordingRef = useRef(false);
   const textRef = useRef(text);
   const memoryItemsRef = useRef(memoryItems);
@@ -255,26 +266,25 @@ function App() {
         window.clearTimeout(wakeTranscriptTimerRef.current);
       }
       recognitionRef.current?.abort();
-      window.speechSynthesis?.cancel();
+      stopCurrentSpeechPipeline();
+      audioContextRef.current?.close().catch(() => undefined);
       stopRobustWakeCapture();
       stopMediaStream();
     };
   }, []);
 
   useEffect(() => {
-    if (!("speechSynthesis" in window)) {
-      return;
-    }
-    const handleVoicesChanged = () => {
-      const pending = pendingSpeechRef.current;
-      if (pending && selectSpanishVoice()) {
-        pendingSpeechRef.current = null;
-        speakText(pending);
-      }
+    const activate = () => {
+      void activateAudioOutputFromGesture();
     };
-    window.speechSynthesis.addEventListener("voiceschanged", handleVoicesChanged);
-    handleVoicesChanged();
-    return () => window.speechSynthesis.removeEventListener("voiceschanged", handleVoicesChanged);
+    window.addEventListener("pointerdown", activate, { capture: true, passive: true });
+    window.addEventListener("touchstart", activate, { capture: true, passive: true });
+    window.addEventListener("keydown", activate, { capture: true });
+    return () => {
+      window.removeEventListener("pointerdown", activate, { capture: true });
+      window.removeEventListener("touchstart", activate, { capture: true });
+      window.removeEventListener("keydown", activate, { capture: true });
+    };
   }, []);
 
   useEffect(() => {
@@ -476,11 +486,13 @@ function App() {
     }
   }
 
-  async function askMemory(questionOverride?: string) {
+  async function askMemory(questionOverride?: string, options: AskMemoryOptions = {}) {
     const question = (questionOverride ?? memoryQuestion).trim();
     if (!question) {
       return;
     }
+    const excludeMemoryIds =
+      options.excludeCurrent && lastRemembered?.memory_id ? [lastRemembered.memory_id] : [];
     setMemoryQuestion(question);
     setMemoryAskStatus("running");
     setError(null);
@@ -489,7 +501,12 @@ function App() {
       const response = await fetch(`${API_BASE}/api/memory/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, mode: SYSTEM_MODE, limit: 6 }),
+        body: JSON.stringify({
+          question,
+          mode: SYSTEM_MODE,
+          limit: 6,
+          exclude_memory_ids: excludeMemoryIds,
+        }),
       });
       if (!response.ok) {
         throw new Error(`Memory question failed: ${response.status}`);
@@ -521,13 +538,20 @@ function App() {
       setRecordingTarget(target);
       recordingTargetRef.current = target;
       audioChunksRef.current = [];
+      recordingCanceledRef.current = false;
+      const useSharedWakeFallback = target === "meeting" && wakeEnabledRef.current && usesAudioWakeFallback();
       if (target === "request") {
         pauseRobustWakeForRecording();
+      } else if (useSharedWakeFallback) {
+        stopRobustWakeCapture();
       } else if (wakeEnabledRef.current && !wakeStreamRef.current) {
         await startRobustWakeListening();
       }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
+      if (useSharedWakeFallback) {
+        startWakeAudioFallbackFromStream(stream.clone());
+      }
       const options = preferredRecorderOptions();
       const recorder = options ? new MediaRecorder(stream, options) : new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
@@ -538,12 +562,19 @@ function App() {
         }
       };
       recorder.onstop = () => {
+        const wasCanceled = recordingCanceledRef.current;
+        recordingCanceledRef.current = false;
         const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" });
         audioChunksRef.current = [];
         stopMediaStream();
+        mediaRecorderRef.current = null;
         setIsRecording(false);
         isRecordingRef.current = false;
         setIsPaused(false);
+        if (wasCanceled) {
+          discardCanceledRecording();
+          return;
+        }
         if (blob.size > 0) {
           void transcribeAudioBlob(
             blob,
@@ -580,6 +611,19 @@ function App() {
       return;
     }
     setAudioMessage(recordingTarget === "request" ? "Procesando solicitud..." : "Procesando audio...");
+    recorder.stop();
+  }
+
+  function cancelRecording() {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state === "inactive") {
+      discardCanceledRecording();
+      return;
+    }
+    recordingCanceledRef.current = true;
+    setWakeMessage("Cancelando grabación");
+    setAudioStatus("idle");
+    setAudioMessage("Cancelando y descartando audio...");
     recorder.stop();
   }
 
@@ -621,10 +665,16 @@ function App() {
         throw new Error(`Audio transcription failed: ${response.status} ${detail}`);
       }
       const payload = (await response.json()) as TranscriptionResponse;
+      const formattedTranscript = target === "request" ? payload.text.trim() : formatTranscript(payload);
+      if (target === "meeting" && hasCancelRecordingMention(formattedTranscript)) {
+        voiceControlPhrasesRef.current = [];
+        discardCanceledRecording();
+        return;
+      }
       const transcript =
         target === "request"
-          ? payload.text.trim()
-          : stripVoiceControlCommands(formatTranscript(payload), voiceControlPhrasesRef.current);
+          ? formattedTranscript
+          : stripVoiceControlCommands(formattedTranscript, voiceControlPhrasesRef.current);
       if (target === "meeting") {
         voiceControlPhrasesRef.current = [];
       }
@@ -671,64 +721,215 @@ function App() {
     setError(null);
     rememberedTranscriptRef.current = null;
     voiceControlPhrasesRef.current = [];
+    recordingCanceledRef.current = false;
   }
 
-  function speakText(value: string) {
+  function discardCanceledRecording() {
+    audioChunksRef.current = [];
+    recordingCanceledRef.current = false;
+    setIsRecording(false);
+    isRecordingRef.current = false;
+    setIsPaused(false);
+    setAudioStatus("idle");
+    setAudioMessage("Grabación cancelada. Audio descartado.");
+    setText("");
+    textRef.current = "";
+    setSpecificRequest("");
+    setAnalysis(null);
+    setExternalResponse(null);
+    setLastRemembered(null);
+    setStatus("idle");
+    setError(null);
+    rememberedTranscriptRef.current = null;
+    voiceControlPhrasesRef.current = [];
+    resumeRobustWakeAfterRecording();
+  }
+
+  async function speakText(value: string) {
     if (!speechEnabled || isRecordingRef.current) {
       return;
     }
-    if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
-      setSpeechMessage("Altavoz no soportado");
-      return;
-    }
-    const spokenText = textForSpeech(value);
+    const spokenText = textForSpeech(value).slice(0, 3900);
     if (!spokenText) {
       return;
     }
 
-    const voice = selectSpanishVoice();
-    const voicesLoaded = window.speechSynthesis.getVoices().length > 0;
-    if (!voice && !voicesLoaded) {
-      pendingSpeechRef.current = spokenText;
-      setSpeechMessage("Cargando voz en español...");
-      return;
-    }
-
-    window.speechSynthesis.cancel();
+    const requestId = speechRequestSeqRef.current + 1;
+    speechRequestSeqRef.current = requestId;
+    stopCurrentSpeechPipeline();
+    const controller = new AbortController();
+    speechAbortControllerRef.current = controller;
     isSpeakingRef.current = true;
-    setSpeechMessage(voice ? `TEO hablando (${voice.lang})` : "TEO hablando en español");
+    setSpeechMessage("Generando voz ElevenLabs...");
     stopBrowserWakeFallback();
     stopRobustWakeCapture();
 
-    const utterance = new SpeechSynthesisUtterance(spokenText);
-    utterance.lang = voice?.lang || "es-MX";
-    utterance.rate = 0.94;
-    utterance.pitch = 0.94;
-    utterance.voice = voice;
-    utterance.onend = () => finishSpeaking();
-    utterance.onerror = () => finishSpeaking("No pude leer la respuesta");
-    window.speechSynthesis.speak(utterance);
-    window.setTimeout(() => window.speechSynthesis.resume(), 120);
+    try {
+      const audioReady = await unlockAudioOutput();
+      if (!audioReady) {
+        pendingSpeechTextRef.current = value;
+        isSpeakingRef.current = false;
+        setSpeechMessage("Toca la pantalla una vez para activar el altavoz");
+        resumeRobustWakeAfterRecording();
+        return;
+      }
+      const response = await fetch(`${API_BASE}/api/audio/speak`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: spokenText, language_code: "es" }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(`ElevenLabs TTS failed: ${response.status} ${detail}`);
+      }
+      if (requestId !== speechRequestSeqRef.current || !speechEnabled) {
+        return;
+      }
+      const audioBytes = await response.arrayBuffer();
+      if (speechAbortControllerRef.current === controller) {
+        speechAbortControllerRef.current = null;
+      }
+      await playElevenLabsAudio(audioBytes, requestId);
+    } catch (err) {
+      if (requestId !== speechRequestSeqRef.current) {
+        return;
+      }
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return;
+      }
+      const message =
+        err instanceof Error && err.name === "NotAllowedError"
+          ? "Brave bloqueó el audio. Toca Altavoz una vez."
+          : "No pude generar voz con ElevenLabs";
+      finishSpeaking(message);
+    }
   }
 
   function finishSpeaking(message = "Altavoz activo") {
+    stopCurrentSpeechPipeline();
     isSpeakingRef.current = false;
     setSpeechMessage(message);
     resumeRobustWakeAfterRecording();
   }
 
+  function stopCurrentSpeechPipeline() {
+    speechAbortControllerRef.current?.abort();
+    speechAbortControllerRef.current = null;
+    stopCurrentSpeechPlayback();
+  }
+
+  function stopCurrentSpeechPlayback() {
+    const source = speechSourceRef.current;
+    speechSourceRef.current = null;
+    if (source) {
+      source.onended = null;
+      try {
+        source.stop();
+      } catch {
+        // Already stopped.
+      }
+    }
+  }
+
   function toggleSpeechOutput() {
+    if (speechEnabled && (!audioOutputUnlockedRef.current || pendingSpeechTextRef.current)) {
+      setSpeechMessage("Activando altavoz...");
+      void activateAudioOutputFromGesture();
+      return;
+    }
     const nextValue = !speechEnabled;
     setSpeechEnabled(nextValue);
     if (!nextValue) {
-      window.speechSynthesis?.cancel();
-      pendingSpeechRef.current = null;
+      speechRequestSeqRef.current += 1;
+      pendingSpeechTextRef.current = null;
+      stopCurrentSpeechPipeline();
       isSpeakingRef.current = false;
       setSpeechMessage("Altavoz apagado");
       resumeRobustWakeAfterRecording();
       return;
     }
-    setSpeechMessage("Altavoz activo");
+    setSpeechMessage("Activando altavoz...");
+    void activateAudioOutputFromGesture();
+  }
+
+  function getAudioContext() {
+    if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+      return audioContextRef.current;
+    }
+    const AudioContextConstructor = window.AudioContext ?? window.webkitAudioContext;
+    if (!AudioContextConstructor) {
+      return null;
+    }
+    audioContextRef.current = new AudioContextConstructor();
+    return audioContextRef.current;
+  }
+
+  async function unlockAudioOutput() {
+    if (audioOutputUnlockedRef.current) {
+      return true;
+    }
+    const context = getAudioContext();
+    if (!context) {
+      setSpeechMessage("Altavoz no soportado");
+      return false;
+    }
+    try {
+      if (context.state === "suspended") {
+        await context.resume();
+      }
+      const source = context.createBufferSource();
+      source.buffer = context.createBuffer(1, 1, context.sampleRate);
+      source.connect(context.destination);
+      source.start(0);
+      audioOutputUnlockedRef.current = true;
+      if (speechEnabled && !isSpeakingRef.current) {
+        setSpeechMessage("Altavoz listo");
+      }
+      return true;
+    } catch {
+      audioOutputUnlockedRef.current = false;
+      return false;
+    }
+  }
+
+  async function activateAudioOutputFromGesture() {
+    const unlocked = await unlockAudioOutput();
+    if (!unlocked || !speechEnabled || isRecordingRef.current || isSpeakingRef.current) {
+      return;
+    }
+    const pending = pendingSpeechTextRef.current;
+    pendingSpeechTextRef.current = null;
+    if (pending) {
+      void speakText(pending);
+    }
+  }
+
+  async function playElevenLabsAudio(audioBytes: ArrayBuffer, requestId: number) {
+    const context = getAudioContext();
+    if (!context) {
+      throw new Error("Audio output is not supported");
+    }
+    if (context.state === "suspended") {
+      await context.resume();
+    }
+    audioOutputUnlockedRef.current = true;
+    const decoded = await context.decodeAudioData(audioBytes.slice(0));
+    if (requestId !== speechRequestSeqRef.current || !speechEnabled) {
+      return;
+    }
+    stopCurrentSpeechPlayback();
+    const source = context.createBufferSource();
+    source.buffer = decoded;
+    source.connect(context.destination);
+    speechSourceRef.current = source;
+    source.onended = () => {
+      if (speechSourceRef.current === source) {
+        finishSpeaking();
+      }
+    };
+    setSpeechMessage("TEO hablando con ElevenLabs");
+    source.start(0);
   }
 
   async function bootAlwaysOnMicrophone() {
@@ -828,10 +1029,7 @@ function App() {
           autoGainControl: true,
         },
       });
-      wakeStreamRef.current = stream;
-      setWakeStatus(recognitionRef.current ? "listening" : "polling");
-      setWakeMessage("Escuchando siempre: di “Hola TEO”");
-      recordWakeChunk();
+      startWakeAudioFallbackFromStream(stream);
     } catch (err) {
       stopRobustWakeCapture();
       if (recognitionRef.current) {
@@ -846,6 +1044,16 @@ function App() {
       setWakeStatus("error");
       setWakeMessage(err instanceof Error ? err.message : "Permiso de micrófono requerido para Hola TEO");
     }
+  }
+
+  function startWakeAudioFallbackFromStream(stream: MediaStream) {
+    wakeSuppressChunkRef.current = false;
+    wakeEnabledRef.current = true;
+    setWakeEnabled(true);
+    wakeStreamRef.current = stream;
+    setWakeStatus(recognitionRef.current ? "listening" : "polling");
+    setWakeMessage(isBraveBrowser() ? "Modo Brave activo: di “Hola TEO”" : "Escuchando siempre: di “Hola TEO”");
+    recordWakeChunk();
   }
 
   function recordWakeChunk() {
@@ -1290,7 +1498,7 @@ function App() {
     if (!command) {
       if (isRecordingRef.current && recordingTargetRef.current === "meeting") {
         rememberVoiceControlPhrase(transcript);
-        setWakeMessage("Grabando. Di: pausa, reanuda o detén la reunión.");
+        setWakeMessage("Grabando. Di: pausa, reanuda, cancela o detén la reunión.");
         return;
       }
       wakeArmedUntilRef.current = now + 9000;
@@ -1320,6 +1528,16 @@ function App() {
 
   async function executeWakeCommand(command: string) {
     const normalizedCommand = normalizeSpeech(command);
+    if (isCancelMeetingCommand(normalizedCommand)) {
+      if (isRecordingRef.current) {
+        rememberVoiceControlPhrase(command);
+        cancelRecording();
+      } else {
+        setWakeMessage("No hay grabación activa para cancelar");
+      }
+      return;
+    }
+
     if (isPauseMeetingCommand(normalizedCommand)) {
       if (mediaRecorderRef.current?.state === "recording") {
         setWakeMessage("Pausando reunión");
@@ -1371,6 +1589,10 @@ function App() {
     const activeTranscript = textRef.current.trim();
     setSpecificRequest(request);
     setWakeMessage(`Consultando: ${request}`);
+    if (isEnterpriseMemoryQuery(request)) {
+      await askMemory(request, { excludeCurrent: shouldExcludeCurrentMemory(request) });
+      return;
+    }
     if (activeTranscript) {
       await analyze(request, activeTranscript, { remember: false });
       return;
@@ -1484,13 +1706,9 @@ function App() {
             <h2>{stageTitle}</h2>
             <p>{stageHint}</p>
             <div className="stage-pills">
-              <span>Audio-first</span>
-              <span>Regex + ML local</span>
-              <span>API protegida</span>
               <span className={audioStatus}>{audioMessage}</span>
               <span className={`speech ${speechEnabled ? "active" : "muted"}`}>{speechMessage}</span>
               <span className={`wake ${wakeStatus}`}>{wakeMessage}</span>
-              {lastWakeTranscript && <span className="heard">Oyó: {lastWakeTranscript}</span>}
             </div>
           </div>
 
@@ -1500,6 +1718,69 @@ function App() {
               <strong>{analysis ? `${analysis.counts.total_entities} elementos` : "en espera"}</strong>
             </div>
             <pre>{safePreview}</pre>
+          </div>
+        </section>
+
+        <section className="lcd-touch-console" aria-label="Controles principales de TEO">
+          <button
+            className={`lcd-big-button record ${isRecording && recordingTarget === "meeting" ? "active" : ""}`}
+            onClick={
+              isRecording && recordingTarget === "meeting"
+                ? stopRecording
+                : () => void startRecording("meeting")
+            }
+            disabled={audioStatus === "transcribing" || (isRecording && recordingTarget !== "meeting")}
+          >
+            <span>{isRecording && recordingTarget === "meeting" ? "Finalizar" : "Grabar"}</span>
+            <strong>{isRecording && recordingTarget === "meeting" ? "Reunión" : "Reunión"}</strong>
+          </button>
+
+          <button
+            className={`lcd-big-button ${isPaused ? "active" : ""}`}
+            onClick={togglePauseRecording}
+            disabled={!isRecording || recordingTarget !== "meeting"}
+          >
+            <span>{isPaused ? "Reanudar" : "Pausar"}</span>
+            <strong>Audio</strong>
+          </button>
+
+          <button
+            className={`lcd-big-button ${isRecording && recordingTarget === "request" ? "active" : ""}`}
+            onClick={
+              isRecording && recordingTarget === "request"
+                ? stopRecording
+                : () => void startRecording("request")
+            }
+            disabled={audioStatus === "transcribing" || (isRecording && recordingTarget !== "request")}
+          >
+            <span>{isRecording && recordingTarget === "request" ? "Enviar" : "Preguntar"}</span>
+            <strong>Voz</strong>
+          </button>
+
+          <button className={`lcd-big-button ${speechEnabled ? "active-soft" : ""}`} onClick={toggleSpeechOutput}>
+            <span>{speechEnabled ? "Altavoz" : "Silencio"}</span>
+            <strong>{speechEnabled ? "Activo" : "Off"}</strong>
+          </button>
+
+          <button
+            className="lcd-big-button danger"
+            onClick={isRecording ? cancelRecording : resetCurrentSession}
+            disabled={!isRecording && !text && !analysis && !externalResponse}
+          >
+            <span>{isRecording ? "Cancelar" : "Limpiar"}</span>
+            <strong>{isRecording ? "Descartar" : "Actual"}</strong>
+          </button>
+        </section>
+
+        <section className="lcd-answer-surface" aria-label="Respuesta de TEO">
+          <div>
+            <span>Respuesta</span>
+            <pre>{externalResponse || memoryAnswer?.answer || "TEO responderá aquí y por altavoz."}</pre>
+          </div>
+          <div className="lcd-answer-meta">
+            <span>{analysis ? `${analysis.counts.total_entities} protegidos` : "Privacidad lista"}</span>
+            <span>{memoryItems.length} memorias</span>
+            <span>{wakeEnabled ? "Hola TEO activo" : "Wake apagado"}</span>
           </div>
         </section>
 
@@ -1626,7 +1907,7 @@ function App() {
             </button>
           </div>
           <div className="lcd-recording-list">
-            {memoryItems.slice(0, 6).map((item) => (
+            {memoryItems.slice(0, 3).map((item) => (
               <div className="lcd-recording-card" key={item.memory_id}>
                 <button className="lcd-recording-open" onClick={() => void openMemoryItem(item.memory_id)}>
                   <strong>{item.title}</strong>
@@ -1731,7 +2012,9 @@ function App() {
                 <div className="chat-actions">
                   <button
                     className="primary"
-                  onClick={() => void askMemory()}
+                    onClick={() =>
+                      void askMemory(memoryQuestion, { excludeCurrent: shouldExcludeCurrentMemory(memoryQuestion) })
+                    }
                     disabled={memoryAskStatus === "running" || !memoryQuestion.trim()}
                   >
                     {memoryAskStatus === "running" ? "Searching" : "Ask memory"}
@@ -2088,32 +2371,15 @@ function spanishPurpose(value: string) {
   ].join(" ");
 }
 
-function selectSpanishVoice() {
-  if (!("speechSynthesis" in window)) {
-    return null;
-  }
-  const voices = window.speechSynthesis.getVoices();
-  const spanishVoices = voices.filter((voice) => voice.lang.toLowerCase().startsWith("es"));
-  const preferredLangs = ["es-mx", "es-419", "es-us", "es-es"];
-  for (const lang of preferredLangs) {
-    const match = spanishVoices.find((voice) => voice.lang.toLowerCase() === lang);
-    if (match) {
-      return match;
-    }
-  }
-  const preferredNames = ["paulina", "monica", "marisol", "helena", "laura", "sabina", "soledad", "jorge", "juan"];
-  return (
-    spanishVoices.find((voice) => preferredNames.some((name) => normalizeSpeech(voice.name).includes(name))) ??
-    spanishVoices[0] ??
-    null
-  );
-}
-
 function browserWakeRecognitionConstructor() {
   if (isBraveBrowser()) {
     return undefined;
   }
   return window.SpeechRecognition ?? window.webkitSpeechRecognition;
+}
+
+function usesAudioWakeFallback() {
+  return !browserWakeRecognitionConstructor();
 }
 
 function isBraveBrowser() {
@@ -2141,10 +2407,25 @@ function isVoiceIntent(command: string) {
     isStopMeetingCommand(command) ||
     isPauseMeetingCommand(command) ||
     isResumeMeetingCommand(command) ||
+    isCancelMeetingCommand(command) ||
     isClearCommand(command) ||
     /\b(resumen|resume|resumir|tareas|pendientes|acciones|riesgos|decisiones|pregunta|dime|extrae|explica|cuentame|cuéntame)\b/.test(
       command,
     )
+  );
+}
+
+function isEnterpriseMemoryQuery(command: string) {
+  const normalized = normalizeSpeech(command);
+  return /\b(memoria|historial|grabaciones|conversacion(?:es)?|reunion(?:es)?|sesion(?:es)?|pasada(?:s)?|pasado(?:s)?|anterior(?:es)?|previa(?:s)?|previo(?:s)?|recordadas?|guardadas?|segundo cerebro)\b/.test(
+    normalized,
+  );
+}
+
+function shouldExcludeCurrentMemory(command: string) {
+  const normalized = normalizeSpeech(command);
+  return /\b(pasada(?:s)?|pasado(?:s)?|anterior(?:es)?|previa(?:s)?|previo(?:s)?|vieja(?:s)?|viejo(?:s)?)\b/.test(
+    normalized,
   );
 }
 
@@ -2193,12 +2474,41 @@ function isResumeMeetingCommand(command: string) {
   );
 }
 
+function isCancelMeetingCommand(command: string) {
+  const hasCancelAction = /\b(cancela|cancelar|descarta|descartar|anula|anular|desecha|desechar)\b/.test(command);
+  if (hasCancelAction && isRecordingRefSafeCommand(command)) {
+    return true;
+  }
+  return (
+    hasCancelAction &&
+    /\b(grabacion|reunion|junta|meeting|sesion|audio)\b/.test(command)
+  );
+}
+
 function isRecordingRefSafeCommand(command: string) {
-  return /\b(grabacion|reunion|junta|meeting|sesion)\b/.test(command) || command.split(" ").length <= 3;
+  return /\b(grabacion|reunion|junta|meeting|sesion|audio)\b/.test(command) || command.split(" ").length <= 3;
 }
 
 function isRecordingControlCommand(command: string) {
-  return isPauseMeetingCommand(command) || isResumeMeetingCommand(command) || isStopMeetingCommand(command);
+  return (
+    isPauseMeetingCommand(command) ||
+    isResumeMeetingCommand(command) ||
+    isStopMeetingCommand(command) ||
+    isCancelMeetingCommand(command)
+  );
+}
+
+function hasCancelRecordingMention(value: string) {
+  const normalized = normalizeSpeech(value);
+  const teoAlias = String.raw`(?:teo|theo|tio|ceo|seo|deo|geo|leo|neo|te\s*o|t\s*e\s*o|t\s*o|te\s+veo)`;
+  const cancelAction = String.raw`(?:cancela|cancelar|descarta|descartar|anula|anular|desecha|desechar)`;
+  const recordingTarget = String.raw`(?:grabacion|reunion|junta|meeting|sesion|audio)`;
+  const directTarget = String.raw`(?:grabacion|audio)`;
+  const wakeCancelPattern = new RegExp(
+    String.raw`\b(?:(?:hola|ola|alo|oye|hey|ei|ok|okay)\s*)?${teoAlias}\s+${cancelAction}(?:\s+\w+){0,3}\s+${recordingTarget}\b`,
+  );
+  const directCancelPattern = new RegExp(String.raw`\b${cancelAction}(?:\s+\w+){0,3}\s+${directTarget}\b`);
+  return wakeCancelPattern.test(normalized) || directCancelPattern.test(normalized);
 }
 
 function stripVoiceControlCommands(transcript: string, phrases: string[]) {
@@ -2230,11 +2540,11 @@ function removePhraseLoosely(value: string, phrase: string) {
 function removeGenericVoiceControls(value: string) {
   return value
     .replace(
-      /\b(?:hola|ola|oye|hey|ei|ok|okay)?\s*(?:teo|theo|tio|ceo|seo|te\s*o|t\s*e\s*o|te\s+veo)\s*(?:pausa|pausar|suspende|suspender|interrumpe|interrumpir|reanuda|reanudar|continua|continuar|sigue|seguir|retoma|retomar|detente|deten|detener|para|parar|termina|terminar|finaliza|finalizar)\s+(?:la|el)?\s*(?:grabacion|grabación|reunion|reunión|junta|meeting|sesion|sesión)\b/gi,
+      /\b(?:hola|ola|alo|oye|hey|ei|ok|okay)?\s*(?:teo|theo|tio|ceo|seo|deo|geo|leo|neo|te\s*o|t\s*e\s*o|t\s*o|te\s+veo)\s*(?:pausa|pausar|suspende|suspender|interrumpe|interrumpir|reanuda|reanudar|continua|continuar|sigue|seguir|retoma|retomar|detente|deten|detener|para|parar|termina|terminar|finaliza|finalizar|cancela|cancelar|descarta|descartar|anula|anular|desecha|desechar)\s+(?:la|el)?\s*(?:grabacion|grabación|reunion|reunión|junta|meeting|sesion|sesión|audio)\b/gi,
       "",
     )
     .replace(
-      /\b(?:pausa|pausar|suspende|suspender|interrumpe|interrumpir|reanuda|reanudar|continua|continuar|sigue|seguir|retoma|retomar|detente|deten|detener|para|parar|termina|terminar|finaliza|finalizar)\s+(?:la|el)?\s*(?:grabacion|grabación|reunion|reunión|junta|meeting|sesion|sesión)\b/gi,
+      /\b(?:pausa|pausar|suspende|suspender|interrumpe|interrumpir|reanuda|reanudar|continua|continuar|sigue|seguir|retoma|retomar|detente|deten|detener|para|parar|termina|terminar|finaliza|finalizar|cancela|cancelar|descarta|descartar|anula|anular|desecha|desechar)\s+(?:la|el)?\s*(?:grabacion|grabación|reunion|reunión|junta|meeting|sesion|sesión|audio)\b/gi,
       "",
     )
     .replace(/[ \t]{2,}/g, " ")

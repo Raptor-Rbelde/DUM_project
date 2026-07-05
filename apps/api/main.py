@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -54,6 +54,14 @@ class AskMemoryRequest(BaseModel):
     question: str = Field(min_length=1)
     mode: SystemMode = SystemMode.INTELLIGENCE
     limit: int = Field(default=6, ge=1, le=12)
+    exclude_memory_ids: list[str] = Field(default_factory=list)
+
+
+class SpeakTextRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+    voice_id: str | None = None
+    model_id: str | None = None
+    language_code: str | None = "es"
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -109,6 +117,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "openai_key_configured": bool(app_settings.openai_api_key),
             "elevenlabs_key_configured": bool(app_settings.elevenlabs_api_key),
             "elevenlabs_stt_model": app_settings.elevenlabs_stt_model,
+            "elevenlabs_tts_voice_id": app_settings.elevenlabs_tts_voice_id,
+            "elevenlabs_tts_model": app_settings.elevenlabs_tts_model,
             "db_path": str(Path(app_settings.db_path)),
             "memory": memory_service.counts(),
         }
@@ -174,6 +184,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "language_probability": result.language_probability,
             "words": result.words,
         }
+
+    @app.post("/api/audio/speak")
+    def speak_text(request: SpeakTextRequest) -> Response:
+        try:
+            result = speech_provider.synthesize_speech(
+                request.text,
+                voice_id=request.voice_id or app_settings.elevenlabs_tts_voice_id,
+                model_id=request.model_id or app_settings.elevenlabs_tts_model,
+                output_format=app_settings.elevenlabs_tts_output_format,
+                language_code=request.language_code,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        audit_store.record(
+            "audio_spoken",
+            metadata={
+                "provider": result.provider,
+                "model_id": result.model_id,
+                "voice_id": result.voice_id,
+                "bytes": len(result.audio),
+            },
+        )
+        return Response(
+            content=result.audio,
+            media_type=result.content_type or "audio/mpeg",
+            headers={
+                "X-Sentinel-Provider": result.provider,
+                "X-Sentinel-Model": result.model_id,
+                "X-Sentinel-Voice": result.voice_id,
+            },
+        )
 
     @app.post("/api/meetings")
     def create_meeting(request: CreateMeetingRequest):
@@ -248,8 +292,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @app.get("/api/memory/search")
-    def search_memory(q: str = Query(min_length=1), limit: int = Query(default=6, ge=1, le=12)):
-        return {"sources": memory_service.search(q, limit=limit)}
+    def search_memory(
+        q: str = Query(min_length=1),
+        limit: int = Query(default=6, ge=1, le=12),
+        exclude_memory_id: list[str] = Query(default=[]),
+    ):
+        return {"sources": memory_service.search(q, limit=limit, exclude_memory_ids=exclude_memory_id)}
 
     @app.post("/api/memory/ask")
     def ask_memory(request: AskMemoryRequest):
@@ -258,6 +306,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             mode=request.mode,
             limit=request.limit,
             cloud_gateway=cloud_gateway,
+            exclude_memory_ids=request.exclude_memory_ids,
         )
 
     @app.get("/api/memory/status")
