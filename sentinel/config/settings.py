@@ -7,6 +7,26 @@ from pathlib import Path
 from sentinel.privacy.sequence_tagger import DEFAULT_SEQUENCE_MODEL_PATH
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -50,4 +70,5 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    _load_env_file(PROJECT_ROOT / ".env")
     return Settings.from_env()

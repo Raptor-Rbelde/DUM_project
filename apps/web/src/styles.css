@@ -349,7 +349,8 @@ pre {
   justify-content: flex-end;
 }
 
-.wake-toggle {
+.wake-toggle,
+.speaker-toggle {
   min-height: 36px;
   border-color: rgba(248, 246, 186, 0.26);
   border-radius: 999px;
@@ -363,6 +364,12 @@ pre {
   border-color: var(--teo-orange);
   background: var(--teo-orange);
   color: var(--teo-purple);
+}
+
+.speaker-toggle.active {
+  border-color: rgba(248, 246, 186, 0.5);
+  background: rgba(248, 246, 186, 0.14);
+  color: var(--teo-cream);
 }
 
 .topbar-actions button,
@@ -494,8 +501,24 @@ pre {
 }
 
 .stage-pills span.wake.awake,
-.stage-pills span.wake.listening {
+.stage-pills span.wake.listening,
+.stage-pills span.wake.polling {
   border-color: rgba(242, 74, 19, 0.45);
+}
+
+.stage-pills span.wake.paused {
+  border-color: rgba(248, 246, 186, 0.44);
+  background: rgba(248, 246, 186, 0.12);
+}
+
+.stage-pills span.speech.active {
+  border-color: rgba(248, 246, 186, 0.44);
+  background: rgba(248, 246, 186, 0.12);
+  color: var(--teo-cream);
+}
+
+.stage-pills span.speech.muted {
+  opacity: 0.62;
 }
 
 .stage-pills span.heard {
@@ -1439,7 +1462,8 @@ pre {
   display: none;
 }
 
-.topbar-actions .wake-toggle {
+.topbar-actions .wake-toggle,
+.topbar-actions .speaker-toggle {
   display: inline-flex;
   align-items: center;
 }

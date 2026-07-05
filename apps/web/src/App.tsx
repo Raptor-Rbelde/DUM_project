@@ -120,7 +120,7 @@ type TranscriptionResponse = {
 };
 
 type RecordingTarget = "meeting" | "request";
-type WakeStatus = "off" | "listening" | "awake" | "unsupported" | "error";
+type WakeStatus = "off" | "listening" | "polling" | "paused" | "awake" | "unsupported" | "error";
 
 type SpeechRecognitionResultLike = {
   isFinal: boolean;
@@ -162,6 +162,9 @@ declare global {
 
 const API_BASE = import.meta.env.VITE_SENTINEL_API_BASE ?? "http://127.0.0.1:8000";
 const SYSTEM_MODE: Mode = "INTELLIGENCE";
+const WAKE_CHUNK_MS = 3200;
+const BROWSER_WAKE_SILENCE_MS = 6500;
+const BROWSER_WAKE_WATCHDOG_MS = 1800;
 
 const samples = {
   normal:
@@ -176,8 +179,8 @@ const defaultRequest =
   "Extrae un resumen ejecutivo, decisiones, tareas accionables, riesgos y próximos pasos usando solamente el contenido seguro.";
 
 function App() {
-  const [text, setText] = useState(samples.confidential);
-  const [specificRequest, setSpecificRequest] = useState(defaultRequest);
+  const [text, setText] = useState("");
+  const [specificRequest, setSpecificRequest] = useState("");
   const [analysis, setAnalysis] = useState<PrivacyAnalysis | null>(null);
   const [externalResponse, setExternalResponse] = useState<string | null>(null);
   const [status, setStatus] = useState<"idle" | "running" | "done" | "error">("idle");
@@ -203,14 +206,35 @@ function App() {
   const [wakeStatus, setWakeStatus] = useState<WakeStatus>("off");
   const [wakeMessage, setWakeMessage] = useState("Di “Hola TEO” para empezar");
   const [lastWakeTranscript, setLastWakeTranscript] = useState("");
+  const [speechEnabled, setSpeechEnabled] = useState(true);
+  const [speechMessage, setSpeechMessage] = useState("Altavoz activo");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+  const recordingTargetRef = useRef<RecordingTarget>("meeting");
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const wakeRestartTimerRef = useRef<number | null>(null);
+  const browserWakeWatchdogTimerRef = useRef<number | null>(null);
+  const browserWakeLastResultAtRef = useRef(0);
+  const wakeRecorderRef = useRef<MediaRecorder | null>(null);
+  const wakeStreamRef = useRef<MediaStream | null>(null);
+  const wakeChunkTimerRef = useRef<number | null>(null);
+  const wakeStopTimerRef = useRef<number | null>(null);
+  const wakeChunksRef = useRef<Blob[]>([]);
+  const wakeBusyRef = useRef(false);
+  const wakeQueuedBlobRef = useRef<Blob | null>(null);
+  const wakeSuppressChunkRef = useRef(false);
+  const wakeFailureCountRef = useRef(0);
   const wakeEnabledRef = useRef(false);
   const lastWakeHitAtRef = useRef(0);
+  const wakeArmedUntilRef = useRef(0);
+  const wakeTranscriptBufferRef = useRef("");
+  const wakeTranscriptTimerRef = useRef<number | null>(null);
+  const voiceControlPhrasesRef = useRef<string[]>([]);
+  const rememberedTranscriptRef = useRef<string | null>(null);
+  const isSpeakingRef = useRef(false);
+  const pendingSpeechRef = useRef<string | null>(null);
   const isRecordingRef = useRef(false);
   const textRef = useRef(text);
   const memoryItemsRef = useRef(memoryItems);
@@ -224,9 +248,33 @@ function App() {
       if (wakeRestartTimerRef.current !== null) {
         window.clearTimeout(wakeRestartTimerRef.current);
       }
+      if (browserWakeWatchdogTimerRef.current !== null) {
+        window.clearTimeout(browserWakeWatchdogTimerRef.current);
+      }
+      if (wakeTranscriptTimerRef.current !== null) {
+        window.clearTimeout(wakeTranscriptTimerRef.current);
+      }
       recognitionRef.current?.abort();
+      window.speechSynthesis?.cancel();
+      stopRobustWakeCapture();
       stopMediaStream();
     };
+  }, []);
+
+  useEffect(() => {
+    if (!("speechSynthesis" in window)) {
+      return;
+    }
+    const handleVoicesChanged = () => {
+      const pending = pendingSpeechRef.current;
+      if (pending && selectSpanishVoice()) {
+        pendingSpeechRef.current = null;
+        speakText(pending);
+      }
+    };
+    window.speechSynthesis.addEventListener("voiceschanged", handleVoicesChanged);
+    handleVoicesChanged();
+    return () => window.speechSynthesis.removeEventListener("voiceschanged", handleVoicesChanged);
   }, []);
 
   useEffect(() => {
@@ -301,25 +349,37 @@ function App() {
     analysis?.safe_content ??
     "El contenido seguro aparecerá aquí con nombres, llaves, fechas y controles sensibles reemplazados antes de cualquier consulta.";
 
-  async function analyze(purposeOverride?: string) {
+  async function analyze(purposeOverride?: string, transcriptOverride?: string, options: { remember?: boolean } = {}) {
+    const transcript = ((transcriptOverride ?? textRef.current) || text).trim();
+    if (!transcript) {
+      setStatus("error");
+      setError("No hay transcripción para analizar.");
+      return;
+    }
+
     setStatus("running");
     setError(null);
     setExternalResponse(null);
     setLastRemembered(null);
+    setText(transcript);
+    textRef.current = transcript;
 
     try {
       let privacy: PrivacyAnalysis;
-      if (rememberTranscript) {
+      const shouldRemember =
+        rememberTranscript && options.remember !== false && rememberedTranscriptRef.current !== transcript;
+      if (shouldRemember) {
         const memoryResponse = await fetch(`${API_BASE}/api/memory/remember`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ transcript: text, title: titleFromText(text), source: "web" }),
+          body: JSON.stringify({ transcript, title: titleFromText(transcript), source: "web" }),
         });
         if (!memoryResponse.ok) {
           throw new Error(`Memory save failed: ${memoryResponse.status}`);
         }
         const remembered = (await memoryResponse.json()) as RememberedTranscript;
         privacy = remembered.analysis;
+        rememberedTranscriptRef.current = transcript;
         setLastRemembered(remembered);
         setMemoryStatus(`Saved: ${remembered.title} (${remembered.chunk_count})`);
         await loadMemoryItems();
@@ -327,7 +387,7 @@ function App() {
         const privacyResponse = await fetch(`${API_BASE}/api/privacy/analyze`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify({ text: transcript }),
         });
         if (!privacyResponse.ok) {
           throw new Error(`Privacy analysis failed: ${privacyResponse.status}`);
@@ -338,7 +398,7 @@ function App() {
       }
       setAnalysis(privacy);
 
-      const purpose = (purposeOverride ?? specificRequest).trim() || defaultRequest;
+      const purpose = spanishPurpose((purposeOverride ?? specificRequest).trim() || defaultRequest);
       const aiResponse = await fetch(`${API_BASE}/api/ai/analyze-safe-content`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -354,6 +414,7 @@ function App() {
       }
       const payload = await aiResponse.json();
       setExternalResponse(payload.reconstructed_response);
+      speakText(payload.reconstructed_response);
 
       setStatus("done");
     } catch (err) {
@@ -435,6 +496,7 @@ function App() {
       }
       const payload = (await response.json()) as MemoryAnswer;
       setMemoryAnswer(payload);
+      speakText(payload.answer);
       setMemoryAskStatus("done");
     } catch (err) {
       setMemoryAskStatus("error");
@@ -450,13 +512,20 @@ function App() {
     }
 
     try {
-      setError(null);
       if (target === "meeting") {
-        setAnalysis(null);
+        prepareNewMeetingRecording();
+      } else {
+        setError(null);
+        setExternalResponse(null);
       }
-      setExternalResponse(null);
       setRecordingTarget(target);
+      recordingTargetRef.current = target;
       audioChunksRef.current = [];
+      if (target === "request") {
+        pauseRobustWakeForRecording();
+      } else if (wakeEnabledRef.current && !wakeStreamRef.current) {
+        await startRobustWakeListening();
+      }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
       const options = preferredRecorderOptions();
@@ -473,6 +542,7 @@ function App() {
         audioChunksRef.current = [];
         stopMediaStream();
         setIsRecording(false);
+        isRecordingRef.current = false;
         setIsPaused(false);
         if (blob.size > 0) {
           void transcribeAudioBlob(
@@ -480,20 +550,27 @@ function App() {
             target === "request" ? "sentinel-request.webm" : "sentinel-recording.webm",
             target,
           );
+        } else {
+          resumeRobustWakeAfterRecording();
         }
       };
 
       recorder.start();
       setIsRecording(true);
+      isRecordingRef.current = true;
       setIsPaused(false);
       setAudioStatus("recording");
-      setAudioMessage(target === "request" ? "Grabando solicitud..." : "Grabando reunión...");
+      setAudioMessage(
+        target === "request" ? "Grabando solicitud..." : "Grabando reunión... comandos de voz activos",
+      );
     } catch (err) {
       stopMediaStream();
       setIsRecording(false);
+      isRecordingRef.current = false;
       setIsPaused(false);
       setAudioStatus("error");
       setAudioMessage(err instanceof Error ? err.message : "No se pudo acceder al micrófono.");
+      resumeRobustWakeAfterRecording();
     }
   }
 
@@ -515,13 +592,15 @@ function App() {
       recorder.pause();
       setIsPaused(true);
       setAudioStatus("paused");
-      setAudioMessage("Grabación pausada");
+      setAudioMessage("Grabación pausada... di “Hola TEO reanuda la reunión”");
       return;
     }
     recorder.resume();
     setIsPaused(false);
     setAudioStatus("recording");
-    setAudioMessage(recordingTarget === "request" ? "Grabando solicitud..." : "Grabando reunión...");
+    setAudioMessage(
+      recordingTarget === "request" ? "Grabando solicitud..." : "Grabando reunión... comandos de voz activos",
+    );
   }
 
   async function transcribeAudioBlob(blob: Blob, filename: string, target: RecordingTarget = "meeting") {
@@ -542,11 +621,19 @@ function App() {
         throw new Error(`Audio transcription failed: ${response.status} ${detail}`);
       }
       const payload = (await response.json()) as TranscriptionResponse;
-      const transcript = target === "request" ? payload.text.trim() : formatTranscript(payload);
+      const transcript =
+        target === "request"
+          ? payload.text.trim()
+          : stripVoiceControlCommands(formatTranscript(payload), voiceControlPhrasesRef.current);
+      if (target === "meeting") {
+        voiceControlPhrasesRef.current = [];
+      }
       if (target === "request") {
-        setSpecificRequest(transcript || defaultRequest);
+        setSpecificRequest(transcript || "");
       } else {
         setText(transcript);
+        textRef.current = transcript;
+        setSpecificRequest("");
       }
       setAudioStatus("done");
       setAudioMessage(
@@ -556,21 +643,96 @@ function App() {
               payload.language_code ? ` · ${payload.language_code}` : ""
             }`,
       );
+      if (target === "meeting" && transcript) {
+        setAudioMessage("Transcripción lista. Generando resumen automático...");
+        await analyze(defaultRequest, transcript, { remember: true });
+        setAudioStatus("done");
+        setAudioMessage("Transcripción y resumen listos. Ya puedes preguntar sobre esta reunión.");
+      }
     } catch (err) {
       setAudioStatus("error");
       setAudioMessage(err instanceof Error ? err.message : "Transcription failed");
+    } finally {
+      resumeRobustWakeAfterRecording();
     }
   }
 
-  async function bootAlwaysOnMicrophone() {
-    const Recognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
-    if (!Recognition) {
-      setWakeEnabled(false);
-      setWakeStatus("unsupported");
-      setWakeMessage("Wake word no soportado en este navegador");
+  function prepareNewMeetingRecording() {
+    setText("");
+    textRef.current = "";
+    setSpecificRequest("");
+    setAnalysis(null);
+    setExternalResponse(null);
+    setLastRemembered(null);
+    setMemoryAnswer(null);
+    setSelectedMemory(null);
+    setMemoryStatus(null);
+    setStatus("idle");
+    setError(null);
+    rememberedTranscriptRef.current = null;
+    voiceControlPhrasesRef.current = [];
+  }
+
+  function speakText(value: string) {
+    if (!speechEnabled || isRecordingRef.current) {
       return;
     }
-    if (!navigator.mediaDevices?.getUserMedia) {
+    if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
+      setSpeechMessage("Altavoz no soportado");
+      return;
+    }
+    const spokenText = textForSpeech(value);
+    if (!spokenText) {
+      return;
+    }
+
+    const voice = selectSpanishVoice();
+    const voicesLoaded = window.speechSynthesis.getVoices().length > 0;
+    if (!voice && !voicesLoaded) {
+      pendingSpeechRef.current = spokenText;
+      setSpeechMessage("Cargando voz en español...");
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+    isSpeakingRef.current = true;
+    setSpeechMessage(voice ? `TEO hablando (${voice.lang})` : "TEO hablando en español");
+    stopBrowserWakeFallback();
+    stopRobustWakeCapture();
+
+    const utterance = new SpeechSynthesisUtterance(spokenText);
+    utterance.lang = voice?.lang || "es-MX";
+    utterance.rate = 0.94;
+    utterance.pitch = 0.94;
+    utterance.voice = voice;
+    utterance.onend = () => finishSpeaking();
+    utterance.onerror = () => finishSpeaking("No pude leer la respuesta");
+    window.speechSynthesis.speak(utterance);
+    window.setTimeout(() => window.speechSynthesis.resume(), 120);
+  }
+
+  function finishSpeaking(message = "Altavoz activo") {
+    isSpeakingRef.current = false;
+    setSpeechMessage(message);
+    resumeRobustWakeAfterRecording();
+  }
+
+  function toggleSpeechOutput() {
+    const nextValue = !speechEnabled;
+    setSpeechEnabled(nextValue);
+    if (!nextValue) {
+      window.speechSynthesis?.cancel();
+      pendingSpeechRef.current = null;
+      isSpeakingRef.current = false;
+      setSpeechMessage("Altavoz apagado");
+      resumeRobustWakeAfterRecording();
+      return;
+    }
+    setSpeechMessage("Altavoz activo");
+  }
+
+  async function bootAlwaysOnMicrophone() {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
       setWakeEnabled(false);
       setWakeStatus("unsupported");
       setWakeMessage("Micrófono no disponible en este navegador");
@@ -588,7 +750,7 @@ function App() {
         },
       });
       permissionStream.getTracks().forEach((track) => track.stop());
-      startWakeListening();
+      await startRobustWakeListening();
     } catch (err) {
       setWakeEnabled(false);
       setWakeStatus("error");
@@ -596,8 +758,384 @@ function App() {
     }
   }
 
+  async function startRobustWakeListening() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setWakeEnabled(false);
+      wakeEnabledRef.current = false;
+      setWakeStatus("unsupported");
+      setWakeMessage("Micrófono no disponible en este navegador");
+      return;
+    }
+
+    if (isSpeakingRef.current) {
+      wakeEnabledRef.current = true;
+      setWakeEnabled(true);
+      setWakeStatus("paused");
+      setWakeMessage("Escucha pausada mientras TEO habla");
+      return;
+    }
+
+    const hasBrowserRecognition = Boolean(browserWakeRecognitionConstructor());
+    wakeEnabledRef.current = true;
+    setWakeEnabled(true);
+    setWakeStatus("listening");
+    setWakeMessage("Escuchando siempre: di “Hola TEO”");
+
+    if (hasBrowserRecognition) {
+      stopRobustWakeCapture();
+      startBrowserWakeFallback();
+      startBrowserWakeWatchdog();
+      return;
+    }
+
+    await startWakeAudioFallback();
+  }
+
+  async function startWakeAudioFallback() {
+    if (typeof MediaRecorder === "undefined") {
+      setWakeEnabled(false);
+      wakeEnabledRef.current = false;
+      setWakeStatus("unsupported");
+      setWakeMessage("Wake word no soportado en este navegador");
+      return;
+    }
+
+    if (wakeRecorderRef.current && wakeRecorderRef.current.state !== "inactive") {
+      wakeEnabledRef.current = true;
+      setWakeEnabled(true);
+      setWakeStatus(recognitionRef.current ? "listening" : "polling");
+      setWakeMessage("Escuchando siempre: di “Hola TEO”");
+      return;
+    }
+
+    if (isRecordingRef.current && recordingTargetRef.current !== "meeting") {
+      wakeEnabledRef.current = true;
+      setWakeEnabled(true);
+      setWakeStatus("paused");
+      setWakeMessage("Wake word pausado durante grabación");
+      return;
+    }
+
+    try {
+      wakeSuppressChunkRef.current = false;
+      wakeEnabledRef.current = true;
+      setWakeEnabled(true);
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      wakeStreamRef.current = stream;
+      setWakeStatus(recognitionRef.current ? "listening" : "polling");
+      setWakeMessage("Escuchando siempre: di “Hola TEO”");
+      recordWakeChunk();
+    } catch (err) {
+      stopRobustWakeCapture();
+      if (recognitionRef.current) {
+        wakeEnabledRef.current = true;
+        setWakeEnabled(true);
+        setWakeStatus("listening");
+        setWakeMessage("Escuchando siempre: di “Hola TEO”");
+        return;
+      }
+      wakeEnabledRef.current = false;
+      setWakeEnabled(false);
+      setWakeStatus("error");
+      setWakeMessage(err instanceof Error ? err.message : "Permiso de micrófono requerido para Hola TEO");
+    }
+  }
+
+  function recordWakeChunk() {
+    if (!shouldCaptureWakeNow()) {
+      return;
+    }
+    const stream = wakeStreamRef.current;
+    if (!stream || stream.getAudioTracks().every((track) => track.readyState === "ended")) {
+      stopRobustWakeCapture();
+      if (wakeEnabledRef.current) {
+        void startRobustWakeListening();
+      }
+      return;
+    }
+
+    try {
+      wakeSuppressChunkRef.current = false;
+      wakeChunksRef.current = [];
+      const options = preferredRecorderOptions();
+      const recorder = options ? new MediaRecorder(stream, options) : new MediaRecorder(stream);
+      wakeRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          wakeChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onerror = () => {
+        if (!wakeEnabledRef.current) {
+          return;
+        }
+        setWakeStatus(recognitionRef.current ? "listening" : "polling");
+        setWakeMessage("Reintentando escucha continua...");
+        if (recorder.state !== "inactive") {
+          try {
+            recorder.stop();
+          } catch {
+            wakeRecorderRef.current = null;
+          }
+        }
+        scheduleWakeChunk(700);
+      };
+      recorder.onstop = () => {
+        if (wakeStopTimerRef.current !== null) {
+          window.clearTimeout(wakeStopTimerRef.current);
+          wakeStopTimerRef.current = null;
+        }
+        const shouldSuppressRestart = wakeSuppressChunkRef.current;
+        wakeSuppressChunkRef.current = false;
+        wakeRecorderRef.current = null;
+        const blob = new Blob(wakeChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        wakeChunksRef.current = [];
+        if (!wakeEnabledRef.current || shouldSuppressRestart || !shouldCaptureWakeNow()) {
+          return;
+        }
+        if (blob.size < 1200) {
+          scheduleWakeChunk(300);
+          return;
+        }
+        void transcribeWakeBlob(blob);
+      };
+
+      recorder.start();
+      wakeStopTimerRef.current = window.setTimeout(() => {
+        if (recorder.state !== "inactive") {
+          try {
+            recorder.stop();
+          } catch {
+            scheduleWakeChunk(700);
+          }
+        }
+      }, WAKE_CHUNK_MS);
+      setWakeStatus(recognitionRef.current ? "listening" : "polling");
+      setWakeMessage("Escuchando siempre: di “Hola TEO”");
+    } catch (err) {
+      setWakeStatus(recognitionRef.current ? "listening" : "polling");
+      setWakeMessage("Reintentando escucha continua...");
+      scheduleWakeChunk(900);
+    }
+  }
+
+  function scheduleWakeChunk(delayMs: number) {
+    if (wakeChunkTimerRef.current !== null) {
+      window.clearTimeout(wakeChunkTimerRef.current);
+    }
+    wakeChunkTimerRef.current = window.setTimeout(() => {
+      wakeChunkTimerRef.current = null;
+      recordWakeChunk();
+    }, delayMs);
+  }
+
+  function startBrowserWakeWatchdog() {
+    if (!browserWakeLastResultAtRef.current) {
+      browserWakeLastResultAtRef.current = Date.now();
+    }
+    if (browserWakeWatchdogTimerRef.current !== null) {
+      window.clearTimeout(browserWakeWatchdogTimerRef.current);
+    }
+    browserWakeWatchdogTimerRef.current = window.setTimeout(() => {
+      browserWakeWatchdogTimerRef.current = null;
+      if (!wakeEnabledRef.current || isSpeakingRef.current) {
+        return;
+      }
+      const silenceMs = Date.now() - browserWakeLastResultAtRef.current;
+      if (
+        recognitionRef.current &&
+        silenceMs >= BROWSER_WAKE_SILENCE_MS &&
+        shouldCaptureWakeNow() &&
+        !wakeStreamRef.current
+      ) {
+        void startWakeAudioFallback();
+      }
+      startBrowserWakeWatchdog();
+    }, BROWSER_WAKE_WATCHDOG_MS);
+  }
+
+  function stopBrowserWakeWatchdog() {
+    if (browserWakeWatchdogTimerRef.current !== null) {
+      window.clearTimeout(browserWakeWatchdogTimerRef.current);
+      browserWakeWatchdogTimerRef.current = null;
+    }
+    browserWakeLastResultAtRef.current = 0;
+  }
+
+  function startBrowserWakeFallback() {
+    const Recognition = browserWakeRecognitionConstructor();
+    if (!Recognition || recognitionRef.current) {
+      return;
+    }
+
+    const recognition = new Recognition();
+    browserWakeLastResultAtRef.current = Date.now();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "es-419";
+    recognition.onresult = (event) => {
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        if (result?.[0]?.transcript) {
+          browserWakeLastResultAtRef.current = Date.now();
+          stopRobustWakeCapture();
+          setLastWakeTranscript(result[0].transcript.trim());
+          queueWakeTranscript(result[0].transcript, result.isFinal);
+        }
+      }
+    };
+    recognition.onerror = (event) => {
+      if (!wakeEnabledRef.current || recognitionRef.current !== recognition) {
+        return;
+      }
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        recognitionRef.current = null;
+        return;
+      }
+      scheduleWakeRestart(recognition, 700);
+    };
+    recognition.onend = () => {
+      if (!wakeEnabledRef.current || recognitionRef.current !== recognition) {
+        return;
+      }
+      scheduleWakeRestart(recognition, 700);
+    };
+
+    recognitionRef.current = recognition;
+    try {
+      recognition.start();
+    } catch {
+      scheduleWakeRestart(recognition, 900);
+    }
+  }
+
+  async function transcribeWakeBlob(blob: Blob) {
+    if (wakeBusyRef.current || !wakeEnabledRef.current || !shouldCaptureWakeNow()) {
+      return;
+    }
+
+    wakeBusyRef.current = true;
+    try {
+      const response = await fetch(`${API_BASE}/api/audio/transcribe?language_code=es&diarize=false`, {
+        method: "POST",
+        headers: {
+          "Content-Type": blob.type || "application/octet-stream",
+          "X-Sentinel-Filename": "sentinel-wake.webm",
+        },
+        body: blob,
+      });
+      if (!response.ok) {
+        wakeFailureCountRef.current += 1;
+        const detail = await response.text().catch(() => "");
+        console.warn("Wake STT failed", response.status, detail);
+        setWakeStatus(recognitionRef.current ? "listening" : "polling");
+        setWakeMessage("Escuchando siempre: di “Hola TEO”");
+        return;
+      }
+      wakeFailureCountRef.current = 0;
+      setWakeStatus(recognitionRef.current ? "listening" : "polling");
+      setWakeMessage("Escuchando siempre: di “Hola TEO”");
+      const payload = (await response.json()) as TranscriptionResponse;
+      const heard = payload.text.trim();
+      if (!heard) {
+        return;
+      }
+      setLastWakeTranscript(heard);
+      await handleWakeTranscript(heard);
+    } catch (err) {
+      wakeFailureCountRef.current += 1;
+      setWakeStatus(recognitionRef.current ? "listening" : "polling");
+      setWakeMessage("Escuchando siempre: di “Hola TEO”");
+    } finally {
+      wakeBusyRef.current = false;
+      const queuedBlob = wakeQueuedBlobRef.current;
+      wakeQueuedBlobRef.current = null;
+      if (queuedBlob && wakeEnabledRef.current && shouldCaptureWakeNow()) {
+        void transcribeWakeBlob(queuedBlob);
+        return;
+      }
+      if (wakeEnabledRef.current && shouldCaptureWakeNow()) {
+        scheduleWakeChunk(250);
+      }
+    }
+  }
+
+  function shouldCaptureWakeNow() {
+    return wakeEnabledRef.current && !isSpeakingRef.current && (!isRecordingRef.current || recordingTargetRef.current === "meeting");
+  }
+
+  function stopRobustWakeCapture() {
+    if (wakeChunkTimerRef.current !== null) {
+      window.clearTimeout(wakeChunkTimerRef.current);
+      wakeChunkTimerRef.current = null;
+    }
+    if (wakeStopTimerRef.current !== null) {
+      window.clearTimeout(wakeStopTimerRef.current);
+      wakeStopTimerRef.current = null;
+    }
+    wakeSuppressChunkRef.current = true;
+    if (wakeRecorderRef.current && wakeRecorderRef.current.state !== "inactive") {
+      try {
+        wakeRecorderRef.current.stop();
+      } catch {
+        wakeRecorderRef.current = null;
+      }
+    } else {
+      wakeRecorderRef.current = null;
+    }
+    wakeStreamRef.current?.getTracks().forEach((track) => track.stop());
+    wakeStreamRef.current = null;
+    wakeChunksRef.current = [];
+    wakeQueuedBlobRef.current = null;
+  }
+
+  function stopBrowserWakeFallback() {
+    stopBrowserWakeWatchdog();
+    if (wakeRestartTimerRef.current !== null) {
+      window.clearTimeout(wakeRestartTimerRef.current);
+      wakeRestartTimerRef.current = null;
+    }
+    if (wakeTranscriptTimerRef.current !== null) {
+      window.clearTimeout(wakeTranscriptTimerRef.current);
+      wakeTranscriptTimerRef.current = null;
+    }
+    wakeTranscriptBufferRef.current = "";
+    const recognition = recognitionRef.current;
+    recognitionRef.current = null;
+    try {
+      recognition?.abort();
+    } catch {
+      // Some browser implementations throw if recognition is already stopped.
+    }
+  }
+
+  function pauseRobustWakeForRecording() {
+    if (!wakeEnabledRef.current) {
+      return;
+    }
+    stopBrowserWakeFallback();
+    stopRobustWakeCapture();
+    setWakeStatus("paused");
+    setWakeMessage("Wake word pausado durante grabación");
+  }
+
+  function resumeRobustWakeAfterRecording() {
+    if (!wakeEnabledRef.current || isRecordingRef.current || isSpeakingRef.current) {
+      return;
+    }
+    void startRobustWakeListening();
+  }
+
   function startWakeListening() {
-    const Recognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
+    const Recognition = browserWakeRecognitionConstructor();
     if (!Recognition) {
       setWakeEnabled(false);
       setWakeStatus("unsupported");
@@ -618,8 +1156,10 @@ function App() {
       for (let index = event.resultIndex; index < event.results.length; index += 1) {
         const result = event.results[index];
         if (result?.[0]?.transcript) {
+          browserWakeLastResultAtRef.current = Date.now();
+          stopRobustWakeCapture();
           setLastWakeTranscript(result[0].transcript.trim());
-          void handleWakeTranscript(result[0].transcript);
+          queueWakeTranscript(result[0].transcript, result.isFinal);
         }
       }
     };
@@ -650,6 +1190,8 @@ function App() {
     };
 
     recognitionRef.current = recognition;
+    browserWakeLastResultAtRef.current = Date.now();
+    startBrowserWakeWatchdog();
     wakeEnabledRef.current = true;
     setWakeEnabled(true);
     setWakeStatus("listening");
@@ -689,30 +1231,115 @@ function App() {
       window.clearTimeout(wakeRestartTimerRef.current);
       wakeRestartTimerRef.current = null;
     }
-    recognitionRef.current?.stop();
+    stopBrowserWakeFallback();
+    stopRobustWakeCapture();
+  }
+
+  function queueWakeTranscript(transcript: string, isFinal: boolean) {
+    const cleanTranscript = transcript.trim();
+    if (!cleanTranscript || !wakeEnabledRef.current) {
+      return;
+    }
+    const previous = wakeTranscriptBufferRef.current;
+    wakeTranscriptBufferRef.current =
+      !previous || cleanTranscript.length >= previous.length || isFinal
+        ? cleanTranscript
+        : `${previous} ${cleanTranscript}`;
+
+    if (wakeTranscriptTimerRef.current !== null) {
+      window.clearTimeout(wakeTranscriptTimerRef.current);
+    }
+    wakeTranscriptTimerRef.current = window.setTimeout(
+      () => {
+        const buffered = wakeTranscriptBufferRef.current.trim();
+        wakeTranscriptBufferRef.current = "";
+        wakeTranscriptTimerRef.current = null;
+        if (buffered) {
+          void handleWakeTranscript(buffered);
+        }
+      },
+      isFinal ? 80 : 850,
+    );
   }
 
   async function handleWakeTranscript(transcript: string) {
     const now = Date.now();
-    if (now - lastWakeHitAtRef.current < 1800) {
+    const command = extractWakeCommand(transcript);
+    const armed = now < wakeArmedUntilRef.current;
+    if (command === null && !armed) {
       return;
     }
-    const command = extractWakeCommand(transcript);
-    if (command === null) {
+    if (!armed && now - lastWakeHitAtRef.current < 1400) {
       return;
     }
     lastWakeHitAtRef.current = now;
     setWakeStatus("awake");
     setWakeMessage(`Detectado: ${transcript.trim()}`);
+    if (command === null) {
+      const armedCommand = normalizeSpeech(transcript);
+      if (!armedCommand) {
+        return;
+      }
+      if (isRecordingControlCommand(armedCommand)) {
+        rememberVoiceControlPhrase(transcript);
+      }
+      wakeArmedUntilRef.current = 0;
+      await executeWakeCommand(armedCommand);
+      return;
+    }
     if (!command) {
+      if (isRecordingRef.current && recordingTargetRef.current === "meeting") {
+        rememberVoiceControlPhrase(transcript);
+        setWakeMessage("Grabando. Di: pausa, reanuda o detén la reunión.");
+        return;
+      }
+      wakeArmedUntilRef.current = now + 9000;
       setWakeMessage("Te escucho. Di: graba reunión, resumen, tareas o riesgos.");
       return;
     }
+    if (isRecordingControlCommand(command)) {
+      rememberVoiceControlPhrase(transcript);
+      rememberVoiceControlPhrase(command);
+    }
+    wakeArmedUntilRef.current = 0;
     await executeWakeCommand(command);
+  }
+
+  function rememberVoiceControlPhrase(phrase: string) {
+    if (!isRecordingRef.current || recordingTargetRef.current !== "meeting") {
+      return;
+    }
+    const normalized = normalizeSpeech(phrase);
+    if (!normalized) {
+      return;
+    }
+    if (!voiceControlPhrasesRef.current.some((item) => normalizeSpeech(item) === normalized)) {
+      voiceControlPhrasesRef.current.push(phrase);
+    }
   }
 
   async function executeWakeCommand(command: string) {
     const normalizedCommand = normalizeSpeech(command);
+    if (isPauseMeetingCommand(normalizedCommand)) {
+      if (mediaRecorderRef.current?.state === "recording") {
+        setWakeMessage("Pausando reunión");
+        togglePauseRecording();
+      } else {
+        setWakeMessage("La reunión ya está pausada o no hay grabación activa");
+      }
+      return;
+    }
+
+    if (isResumeMeetingCommand(normalizedCommand)) {
+      if (mediaRecorderRef.current?.state === "paused") {
+        setWakeMessage("Reanudando reunión");
+        togglePauseRecording();
+      } else {
+        setWakeMessage("No hay reunión pausada para reanudar");
+      }
+      return;
+    }
+
     if (isStopMeetingCommand(normalizedCommand)) {
       if (isRecordingRef.current) {
         setWakeMessage("Deteniendo grabación");
@@ -720,6 +1347,11 @@ function App() {
       } else {
         setWakeMessage("No hay grabación activa");
       }
+      return;
+    }
+
+    if (isRecordingRef.current && recordingTargetRef.current === "meeting") {
+      setWakeMessage("Durante la reunión solo acepto: pausa, reanuda o detén.");
       return;
     }
 
@@ -736,10 +1368,11 @@ function App() {
     }
 
     const request = voiceCommandToRequest(command);
+    const activeTranscript = textRef.current.trim();
     setSpecificRequest(request);
-    setWakeMessage("Consulta capturada por voz");
-    if (textRef.current.trim()) {
-      await analyze(request);
+    setWakeMessage(`Consultando: ${request}`);
+    if (activeTranscript) {
+      await analyze(request, activeTranscript, { remember: false });
       return;
     }
     if (memoryItemsRef.current.length > 0) {
@@ -759,15 +1392,20 @@ function App() {
       stopRecording();
     }
     setText("");
+    textRef.current = "";
+    setSpecificRequest("");
     setAnalysis(null);
     setExternalResponse(null);
     setLastRemembered(null);
     setMemoryAnswer(null);
     setSelectedMemory(null);
+    setMemoryStatus(null);
     setStatus("idle");
     setError(null);
     setAudioStatus("idle");
     setAudioMessage("Micrófono listo");
+    rememberedTranscriptRef.current = null;
+    voiceControlPhrasesRef.current = [];
   }
 
   return (
@@ -828,7 +1466,10 @@ function App() {
           </div>
           <div className="topbar-actions">
             <span className={`status ${status}`}>{status}</span>
-            <button className={`wake-toggle ${wakeEnabled ? "active" : ""}`} onClick={wakeEnabled ? stopWakeListening : startWakeListening}>
+            <button className={`speaker-toggle ${speechEnabled ? "active" : ""}`} onClick={toggleSpeechOutput}>
+              {speechEnabled ? "Altavoz" : "Silencio"}
+            </button>
+            <button className={`wake-toggle ${wakeEnabled ? "active" : ""}`} onClick={wakeEnabled ? stopWakeListening : () => void startRobustWakeListening()}>
               {wakeEnabled ? "Siempre escuchando" : "Reintentar micrófono"}
             </button>
             <button onClick={() => void loadMemoryItems()} disabled={memoryListStatus === "running"}>
@@ -847,6 +1488,7 @@ function App() {
               <span>Regex + ML local</span>
               <span>API protegida</span>
               <span className={audioStatus}>{audioMessage}</span>
+              <span className={`speech ${speechEnabled ? "active" : "muted"}`}>{speechMessage}</span>
               <span className={`wake ${wakeStatus}`}>{wakeMessage}</span>
               {lastWakeTranscript && <span className="heard">Oyó: {lastWakeTranscript}</span>}
             </div>
@@ -890,6 +1532,7 @@ function App() {
             onChange={(event) => {
               const file = event.target.files?.[0];
               if (file) {
+                prepareNewMeetingRecording();
                 void transcribeAudioBlob(file, file.name);
               }
               event.currentTarget.value = "";
@@ -1422,30 +2065,184 @@ function normalizeSpeech(value: string) {
     .trim();
 }
 
+function textForSpeech(value: string) {
+  return value
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^\s*[-*]\s+/gm, "")
+    .replace(/^\s*\d+\.\s+/gm, "")
+    .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
+    .replace(/[>#_~]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function spanishPurpose(value: string) {
+  return [
+    "Responde siempre en español natural y claro, salvo que el usuario pida explícitamente otro idioma.",
+    "Usa un tono conversacional, breve y apto para ser leído en voz alta por TEO.",
+    `Instrucción del usuario: ${value}`,
+  ].join(" ");
+}
+
+function selectSpanishVoice() {
+  if (!("speechSynthesis" in window)) {
+    return null;
+  }
+  const voices = window.speechSynthesis.getVoices();
+  const spanishVoices = voices.filter((voice) => voice.lang.toLowerCase().startsWith("es"));
+  const preferredLangs = ["es-mx", "es-419", "es-us", "es-es"];
+  for (const lang of preferredLangs) {
+    const match = spanishVoices.find((voice) => voice.lang.toLowerCase() === lang);
+    if (match) {
+      return match;
+    }
+  }
+  const preferredNames = ["paulina", "monica", "marisol", "helena", "laura", "sabina", "soledad", "jorge", "juan"];
+  return (
+    spanishVoices.find((voice) => preferredNames.some((name) => normalizeSpeech(voice.name).includes(name))) ??
+    spanishVoices[0] ??
+    null
+  );
+}
+
+function browserWakeRecognitionConstructor() {
+  if (isBraveBrowser()) {
+    return undefined;
+  }
+  return window.SpeechRecognition ?? window.webkitSpeechRecognition;
+}
+
+function isBraveBrowser() {
+  return typeof navigator !== "undefined" && "brave" in navigator;
+}
+
 function extractWakeCommand(transcript: string) {
   const normalized = normalizeSpeech(transcript);
   const wakeMatch = normalized.match(
-    /\b(?:(?:hola|ola|oye|hey|ei|ok|okay)\s+)?(?:teo|theo|tio|ceo|seo|te\s*o|t\s*e\s*o|te\s+veo)\b/,
+    /\b(?:(?:hola|ola|alo|oye|hey|ei|ok|okay)\s*)?(?:teo|theo|tio|ceo|seo|deo|geo|leo|neo|te\s*o|t\s*e\s*o|t\s*o|te\s+veo)\b/,
   );
   if (!wakeMatch || wakeMatch.index === undefined) {
+    const greetingMatch = normalized.match(/^(?:hola|ola|alo|oye|hey|ei|ok|okay)\s+(.+)$/);
+    if (greetingMatch?.[1] && isVoiceIntent(greetingMatch[1])) {
+      return greetingMatch[1].trim();
+    }
     return null;
   }
   return normalized.slice(wakeMatch.index + wakeMatch[0].length).trim();
 }
 
-function isStartMeetingCommand(command: string) {
+function isVoiceIntent(command: string) {
   return (
-    /\b(graba|grabar|inicia|iniciar|empieza|empezar|comienza|comenzar|registra|registrar|captura|capturar)\b/.test(
+    isStartMeetingCommand(command) ||
+    isStopMeetingCommand(command) ||
+    isPauseMeetingCommand(command) ||
+    isResumeMeetingCommand(command) ||
+    isClearCommand(command) ||
+    /\b(resumen|resume|resumir|tareas|pendientes|acciones|riesgos|decisiones|pregunta|dime|extrae|explica|cuentame|cuéntame)\b/.test(
       command,
-    ) && /\b(reunion|junta|meeting|sesion)\b/.test(command)
+    )
   );
 }
 
+function isStartMeetingCommand(command: string) {
+  const hasStartAction =
+    /\b(graba|grabar|inicia|iniciar|empieza|empezar|comienza|comenzar|registra|registrar|captura|capturar|arranca|arrancar|empecemos)\b/.test(
+      command,
+    );
+  const hasRecordingTarget = /\b(grabacion|audio|reunion|junta|meeting|sesion|transcripcion)\b/.test(command);
+  const hasImplicitRecordingAction = /\b(graba|grabar|grabando|empecemos)\b/.test(command);
+  return hasStartAction && (hasRecordingTarget || hasImplicitRecordingAction);
+}
+
 function isStopMeetingCommand(command: string) {
+  const hasStopAction = /\b(detente|deten|detener|para|parar|termina|terminar|finaliza|finalizar|alto|corta|cortar)\b/.test(
+    command,
+  );
+  if (hasStopAction && isRecordingRefSafeCommand(command)) {
+    return true;
+  }
   return (
-    /\b(detente|deten|detener|para|parar|termina|terminar|finaliza|finalizar)\b/.test(command) &&
+    hasStopAction &&
     /\b(grabacion|reunion|junta|meeting|sesion)\b/.test(command)
   );
+}
+
+function isPauseMeetingCommand(command: string) {
+  const hasPauseAction = /\b(pausa|pausar|suspende|suspender|interrumpe|interrumpir)\b/.test(command);
+  if (hasPauseAction && isRecordingRefSafeCommand(command)) {
+    return true;
+  }
+  return (
+    hasPauseAction &&
+    /\b(grabacion|reunion|junta|meeting|sesion)\b/.test(command)
+  );
+}
+
+function isResumeMeetingCommand(command: string) {
+  const hasResumeAction = /\b(reanuda|reanudar|continua|continuar|sigue|seguir|retoma|retomar)\b/.test(command);
+  if (hasResumeAction && isRecordingRefSafeCommand(command)) {
+    return true;
+  }
+  return (
+    hasResumeAction &&
+    /\b(grabacion|reunion|junta|meeting|sesion)\b/.test(command)
+  );
+}
+
+function isRecordingRefSafeCommand(command: string) {
+  return /\b(grabacion|reunion|junta|meeting|sesion)\b/.test(command) || command.split(" ").length <= 3;
+}
+
+function isRecordingControlCommand(command: string) {
+  return isPauseMeetingCommand(command) || isResumeMeetingCommand(command) || isStopMeetingCommand(command);
+}
+
+function stripVoiceControlCommands(transcript: string, phrases: string[]) {
+  if (phrases.length === 0) {
+    return transcript.trim();
+  }
+  const withoutKnownPhrases = phrases.reduce(
+    (current, phrase) => removePhraseLoosely(current, phrase),
+    transcript,
+  );
+  return withoutKnownPhrases
+    .split("\n")
+    .map((line) => removeGenericVoiceControls(line))
+    .filter((line) => line.trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function removePhraseLoosely(value: string, phrase: string) {
+  const words = normalizeSpeech(phrase).split(" ").filter((word) => word.length > 1);
+  if (words.length === 0) {
+    return value;
+  }
+  const pattern = words.map(escapeRegExp).join("[\\s,.;:¿?¡!\"'`*_-]+");
+  return value.replace(new RegExp(pattern, "gi"), "").replace(/[ \t]{2,}/g, " ");
+}
+
+function removeGenericVoiceControls(value: string) {
+  return value
+    .replace(
+      /\b(?:hola|ola|oye|hey|ei|ok|okay)?\s*(?:teo|theo|tio|ceo|seo|te\s*o|t\s*e\s*o|te\s+veo)\s*(?:pausa|pausar|suspende|suspender|interrumpe|interrumpir|reanuda|reanudar|continua|continuar|sigue|seguir|retoma|retomar|detente|deten|detener|para|parar|termina|terminar|finaliza|finalizar)\s+(?:la|el)?\s*(?:grabacion|grabación|reunion|reunión|junta|meeting|sesion|sesión)\b/gi,
+      "",
+    )
+    .replace(
+      /\b(?:pausa|pausar|suspende|suspender|interrumpe|interrumpir|reanuda|reanudar|continua|continuar|sigue|seguir|retoma|retomar|detente|deten|detener|para|parar|termina|terminar|finaliza|finalizar)\s+(?:la|el)?\s*(?:grabacion|grabación|reunion|reunión|junta|meeting|sesion|sesión)\b/gi,
+      "",
+    )
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function isClearCommand(command: string) {
@@ -1453,19 +2250,6 @@ function isClearCommand(command: string) {
 }
 
 function voiceCommandToRequest(command: string) {
-  const normalized = normalizeSpeech(command);
-  if (/\b(resumen|resume|resumir)\b/.test(normalized)) {
-    return "Extrae un resumen ejecutivo de la reunión usando solamente el contenido seguro.";
-  }
-  if (/\b(tareas|pendientes|to do|acciones|accionables)\b/.test(normalized)) {
-    return "Extrae las tareas accionables, responsables sugeridos y próximos pasos usando solamente el contenido seguro.";
-  }
-  if (/\b(riesgos|riesgo|alertas|problemas)\b/.test(normalized)) {
-    return "Identifica los riesgos, alertas y puntos críticos mencionados usando solamente el contenido seguro.";
-  }
-  if (/\b(decisiones|acuerdos|decision)\b/.test(normalized)) {
-    return "Extrae las decisiones y acuerdos tomados usando solamente el contenido seguro.";
-  }
   return command.trim() || defaultRequest;
 }
 
